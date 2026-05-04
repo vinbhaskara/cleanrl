@@ -1,4 +1,19 @@
-# docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo-rnd/#ppo_rnd_envpoolpy
+# PPO + Curiosity-Critic, drop-in replacement for the intrinsic reward of
+# `ppo_rnd_envpool.py`. PPO/GAE/clip/entropy/value/coef hyperparameters and
+# core logging scalars match `ppo_rnd_envpool.py`. The RND target and predictor
+# are replaced by a forward-dynamics World Model (WM) and Neural Critic (NC).
+# The per-transition Curiosity-Critic objective is:
+#
+#   e_before = 0.5 * ||theta_t(s_t,a_t) - s_{t+1}||^2
+#   theta_{t+1} <- GradStep(theta_t; s_t, a_t, s_{t+1})
+#   e_after  = 0.5 * ||theta_{t+1}(s_t,a_t) - s_{t+1}||^2
+#   phi_{t+1} <- GradStep(phi_t; s_t, a_t, e_after)
+#   r_t = max(0, e_before - phi_{t+1}(s_t, a_t))
+#
+# PPO, reward normalization, GAE, and auxiliary-model update cadence mirror
+# `ppo_rnd_envpool.py`: a rollout's rewards are computed with frozen WM/NC
+# snapshots; the WM and NC are then updated on PPO minibatches, so the next
+# rollout uses phi after fitting post-WM-update error targets.
 import os
 import random
 import time
@@ -37,7 +52,7 @@ class Args:
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
     save_model: bool = False
-    """if toggled, saves the final policy, RND predictor, and RND target weights"""
+    """if toggled, saves the final policy, World Model, and Neural Critic weights"""
 
     # Algorithm specific arguments
     env_id: str = "MontezumaRevenge-v5"
@@ -75,9 +90,10 @@ class Args:
     target_kl: float = None
     """the target KL divergence threshold"""
 
-    # RND arguments
+    # Curiosity-Critic arguments (kept identical to ppo_rnd_envpool.py's RND args
+    # so PPO+RND and PPO+CC share every hyperparameter that controls training.)
     update_proportion: float = 0.25
-    """proportion of exp used for predictor update"""
+    """proportion of exp used for World-Model and Neural-Critic update"""
     int_coef: float = 1.0
     """coefficient of extrinsic reward"""
     ext_coef: float = 2.0
@@ -183,18 +199,94 @@ class Agent(nn.Module):
         return self.critic_ext(features + hidden), self.critic_int(features + hidden)
 
 
-class RNDModel(nn.Module):
-    def __init__(self, input_size, output_size):
+def _action_planes(action_onehot, height, width):
+    return action_onehot[:, :, None, None].expand(-1, -1, height, width)
+
+
+class ForwardCNN(nn.Module):
+    """
+    Action-conditioned U-Net World Model (WM).
+
+    The one-hot action is broadcast as extra spatial channels and concatenated
+    with the normalized frame stack. The encoder downsamples to a 7x7 bottleneck,
+    the decoder upsamples back to 84x84, and skip connections preserve spatial
+    detail for next-frame prediction.
+    """
+
+    def __init__(self, num_actions, frame_stack=4, channels=(64, 128, 256)):
         super().__init__()
+        c1, c2, c3 = channels
+        self.num_actions = num_actions
+        self.down1 = nn.Sequential(
+            layer_init(
+                nn.Conv2d(in_channels=frame_stack + num_actions, out_channels=c1, kernel_size=8, stride=4)
+            ),
+            nn.LeakyReLU(),
+        )
+        self.down2 = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c1, out_channels=c2, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+        )
+        self.bottleneck = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c2, out_channels=c3, kernel_size=3, stride=1)),
+            nn.LeakyReLU(),
+        )
+        self.up2 = nn.Sequential(
+            layer_init(
+                nn.ConvTranspose2d(in_channels=c3, out_channels=c2, kernel_size=3, stride=1)
+            ),
+            nn.LeakyReLU(),
+        )
+        self.fuse2 = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c2 * 2, out_channels=c2, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+        )
+        self.up1 = nn.Sequential(
+            layer_init(nn.ConvTranspose2d(in_channels=c2, out_channels=c1, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+        )
+        self.fuse1 = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c1 * 2, out_channels=c1, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+        )
+        self.out = nn.Sequential(
+            layer_init(
+                nn.ConvTranspose2d(in_channels=c1, out_channels=1, kernel_size=8, stride=4)
+            ),
+        )
 
-        self.input_size = input_size
-        self.output_size = output_size
+    def forward(self, obs_stack, action_onehot):
+        _, _, height, width = obs_stack.shape
+        action_map = _action_planes(action_onehot, height, width)
+        h = torch.cat([obs_stack, action_map], dim=1)
+        skip1 = self.down1(h)
+        skip2 = self.down2(skip1)
+        bottleneck = self.bottleneck(skip2)
 
+        up2 = self.up2(bottleneck)
+        up2 = self.fuse2(torch.cat([up2, skip2], dim=1))
+        up1 = self.up1(up2)
+        up1 = self.fuse1(torch.cat([up1, skip1], dim=1))
+        return self.out(up1)
+
+
+class CuriosityCriticCNN(nn.Module):
+    """
+    Action-conditioned Neural Critic (NC) for the scalar error baseline.
+
+    The NC is trained on the same masked PPO minibatches as the WM, after the WM
+    step, to predict the post-update RND-style WM error for each transition. Its
+    conv/MLP layout mirrors RND's predictor, with state-action input channels
+    and a scalar output instead of a 512-d feature output.
+    """
+
+    def __init__(self, num_actions, frame_stack=4):
+        super().__init__()
         feature_output = 7 * 7 * 64
-
-        # Prediction network
-        self.predictor = nn.Sequential(
-            layer_init(nn.Conv2d(in_channels=1, out_channels=32, kernel_size=8, stride=4)),
+        self.encoder = nn.Sequential(
+            layer_init(
+                nn.Conv2d(in_channels=frame_stack + num_actions, out_channels=32, kernel_size=8, stride=4)
+            ),
             nn.LeakyReLU(),
             layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2)),
             nn.LeakyReLU(),
@@ -205,30 +297,14 @@ class RNDModel(nn.Module):
             nn.ReLU(),
             layer_init(nn.Linear(512, 512)),
             nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
+            layer_init(nn.Linear(512, 1)),
         )
 
-        # Target network
-        self.target = nn.Sequential(
-            layer_init(nn.Conv2d(in_channels=1, out_channels=32, kernel_size=8, stride=4)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1)),
-            nn.LeakyReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(feature_output, 512)),
-        )
-
-        # target network is not trainable
-        for param in self.target.parameters():
-            param.requires_grad = False
-
-    def forward(self, next_obs):
-        target_feature = self.target(next_obs)
-        predict_feature = self.predictor(next_obs)
-
-        return predict_feature, target_feature
+    def forward(self, obs_stack, action_onehot):
+        _, _, height, width = obs_stack.shape
+        action_map = _action_planes(action_onehot, height, width)
+        h = torch.cat([obs_stack, action_map], dim=1)
+        return self.encoder(h)
 
 
 class RewardForwardFilter:
@@ -242,6 +318,21 @@ class RewardForwardFilter:
         else:
             self.rewems = self.rewems * self.gamma + rews
         return self.rewems
+
+
+def _normalize_stack(stack, mean_t, std_t):
+    """Normalize with RND's single-channel obs RMS broadcast across frame stacks."""
+    return ((stack - mean_t) / std_t).clip(-5, 5).float()
+
+
+def _rnd_reward_error_per_sample(pred, target):
+    """Raw curiosity error, matching RND's 0.5 * squared L2 per sample."""
+    return 0.5 * (pred - target).flatten(1).pow(2).sum(1)
+
+
+def _rnd_update_loss_per_sample(pred, target):
+    """Auxiliary-model update metric, matching RND's per-sample MSE."""
+    return F.mse_loss(pred, target, reduction="none").flatten(1).mean(1)
 
 
 def _cpu_state_dict(module):
@@ -296,11 +387,22 @@ if __name__ == "__main__":
     envs = RecordEpisodeStatistics(envs)
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
+    num_actions = envs.single_action_space.n
+
     agent = Agent(envs).to(device)
-    rnd_model = RNDModel(4, envs.single_action_space.n).to(device)
-    combined_parameters = list(agent.parameters()) + list(rnd_model.predictor.parameters())
+    world_model = ForwardCNN(num_actions=num_actions, frame_stack=4).to(device)
+    neural_critic = CuriosityCriticCNN(num_actions=num_actions, frame_stack=4).to(device)
+
+    combined_parameters = list(agent.parameters()) + list(world_model.parameters())
     optimizer = optim.Adam(
         combined_parameters,
+        lr=args.learning_rate,
+        eps=1e-5,
+    )
+    # The critic target (post-update WM error) is only available after the WM
+    # step completes, so the critic gets its own optimizer.
+    critic_optimizer = optim.Adam(
+        neural_critic.parameters(),
         lr=args.learning_rate,
         eps=1e-5,
     )
@@ -318,6 +420,7 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     ext_values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     int_values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    next_frames = torch.zeros((args.num_steps, args.num_envs, 84, 84)).to(device)
     avg_returns = deque(maxlen=20)
 
     # TRY NOT TO MODIFY: start the game
@@ -346,6 +449,11 @@ if __name__ == "__main__":
             frac = 1.0 - (update - 1.0) / num_updates
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
+            critic_optimizer.param_groups[0]["lr"] = lrnow
+
+        # obs_rms is constant during the rollout (only updated post-rollout); cache normalization tensors once.
+        rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
+        rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
 
         for step in range(0, args.num_steps):
             global_step += 1 * args.num_envs
@@ -368,15 +476,23 @@ if __name__ == "__main__":
             next_obs, reward, done, info = envs.step(action.cpu().numpy())
             rewards[step] = torch.tensor(reward).to(device).view(-1)
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
-            rnd_next_obs = (
-                (
-                    (next_obs[:, 3, :, :].reshape(args.num_envs, 1, 84, 84) - torch.from_numpy(obs_rms.mean).to(device))
-                    / torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
-                ).clip(-5, 5)
-            ).float()
-            target_next_feature = rnd_model.target(rnd_next_obs)
-            predict_next_feature = rnd_model.predictor(rnd_next_obs)
-            curiosity_rewards[step] = ((target_next_feature - predict_next_feature).pow(2).sum(1) / 2).data
+            next_frames[step] = next_obs[:, 3, :, :]
+
+            obs_normalized = _normalize_stack(obs[step], rollout_obs_mean, rollout_obs_std)
+            target_next = _normalize_stack(
+                next_obs[:, 3, :, :].reshape(args.num_envs, 1, 84, 84),
+                rollout_obs_mean,
+                rollout_obs_std,
+            )
+            action_onehot = F.one_hot(action.long(), num_classes=num_actions).float()
+
+            # Match RND rollout timing: compute intrinsic rewards with frozen auxiliary models.
+            with torch.no_grad():
+                wm_pred = world_model(obs_normalized, action_onehot)
+                error_before = _rnd_reward_error_per_sample(wm_pred, target_next)
+                critic_pred = neural_critic(obs_normalized, action_onehot).squeeze(-1).clamp(min=0)
+                curiosity_rewards[step] = (error_before - critic_pred).clamp(min=0).detach()
+
             for idx, d in enumerate(done):
                 if d and info["lives"][idx] == 0:
                     avg_returns.append(info["r"][idx])
@@ -444,6 +560,7 @@ if __name__ == "__main__":
         b_ext_returns = ext_returns.reshape(-1)
         b_int_returns = int_returns.reshape(-1)
         b_ext_values = ext_values.reshape(-1)
+        b_next_frames = next_frames.reshape(-1, 84, 84)
 
         b_advantages = b_int_advantages * args.int_coef + b_ext_advantages * args.ext_coef
 
@@ -451,33 +568,43 @@ if __name__ == "__main__":
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
-
-        rnd_next_obs = (
-            (
-                (b_obs[:, 3, :, :].reshape(-1, 1, 84, 84) - torch.from_numpy(obs_rms.mean).to(device))
-                / torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
-            ).clip(-5, 5)
-        ).float()
+        update_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
+        update_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
 
         clipfracs = []
+        curiosity_critic_loss_sum = 0.0
+        curiosity_error_before_sum = 0.0
+        curiosity_error_after_sum = 0.0
+        curiosity_critic_pred_sum = 0.0
+        n_minibatch_steps = 0
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                predict_next_state_feature, target_next_state_feature = rnd_model(rnd_next_obs[mb_inds])
-                forward_loss = F.mse_loss(
-                    predict_next_state_feature, target_next_state_feature.detach(), reduction="none"
-                ).mean(-1)
+                mb_obs_normalized = _normalize_stack(b_obs[mb_inds], update_obs_mean, update_obs_std)
+                mb_target_next = _normalize_stack(
+                    b_next_frames[mb_inds].reshape(-1, 1, 84, 84),
+                    update_obs_mean,
+                    update_obs_std,
+                )
+                mb_actions_long = b_actions.long()[mb_inds]
+                mb_actions_onehot = F.one_hot(mb_actions_long, num_classes=num_actions).float()
+
+                # WM update mirrors RND predictor training: same minibatches, mask, and MSE metric.
+                wm_pred = world_model(mb_obs_normalized, mb_actions_onehot)
+                forward_loss = _rnd_update_loss_per_sample(wm_pred, mb_target_next.detach())
+                error_before_mb = _rnd_reward_error_per_sample(wm_pred.detach(), mb_target_next).detach()
 
                 mask = torch.rand(len(forward_loss), device=device)
                 mask = (mask < args.update_proportion).type(torch.FloatTensor).to(device)
                 forward_loss = (forward_loss * mask).sum() / torch.max(
                     mask.sum(), torch.tensor([1], device=device, dtype=torch.float32)
                 )
+
                 _, newlogprob, entropy, new_ext_values, new_int_values = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions.long()[mb_inds]
+                    b_obs[mb_inds], mb_actions_long
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
@@ -526,6 +653,32 @@ if __name__ == "__main__":
                     )
                 optimizer.step()
 
+                with torch.no_grad():
+                    post_wm_pred = world_model(mb_obs_normalized, mb_actions_onehot)
+                    error_after_mb = _rnd_reward_error_per_sample(post_wm_pred, mb_target_next).detach()
+
+                # NC learns the post-WM-update error baseline on the same masked samples.
+                critic_pred_train = neural_critic(mb_obs_normalized, mb_actions_onehot).squeeze(-1)
+                critic_loss_per = F.mse_loss(critic_pred_train, error_after_mb, reduction="none")
+                critic_loss = (critic_loss_per * mask).sum() / torch.max(
+                    mask.sum(), torch.tensor([1], device=device, dtype=torch.float32)
+                )
+
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                if args.max_grad_norm:
+                    nn.utils.clip_grad_norm_(
+                        neural_critic.parameters(),
+                        args.max_grad_norm,
+                    )
+                critic_optimizer.step()
+
+                curiosity_critic_loss_sum += critic_loss.item()
+                curiosity_error_before_sum += error_before_mb.mean().item()
+                curiosity_error_after_sum += error_after_mb.mean().item()
+                curiosity_critic_pred_sum += critic_pred_train.detach().clamp(min=0).mean().item()
+                n_minibatch_steps += 1
+
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
@@ -538,6 +691,11 @@ if __name__ == "__main__":
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/fwd_loss", forward_loss.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        # Curiosity-Critic-specific scalars (averaged across all minibatches in this PPO cycle).
+        writer.add_scalar("losses/critic_loss", curiosity_critic_loss_sum / max(n_minibatch_steps, 1), global_step)
+        writer.add_scalar("losses/error_before", curiosity_error_before_sum / max(n_minibatch_steps, 1), global_step)
+        writer.add_scalar("losses/error_after", curiosity_error_after_sum / max(n_minibatch_steps, 1), global_step)
+        writer.add_scalar("charts/critic_pred_mean", curiosity_critic_pred_sum / max(n_minibatch_steps, 1), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
@@ -547,15 +705,15 @@ if __name__ == "__main__":
         model_paths = {
             "checkpoint": f"{model_dir}/{args.exp_name}.cleanrl_model",
             "policy_model": f"{model_dir}/policy_model.pt",
-            "rnd_predictor": f"{model_dir}/rnd_predictor.pt",
-            "rnd_target": f"{model_dir}/rnd_target.pt",
+            "world_model": f"{model_dir}/world_model.pt",
+            "neural_critic": f"{model_dir}/neural_critic.pt",
         }
         checkpoint = {
             "args": vars(args),
             "global_step": global_step,
             "policy_model": _cpu_state_dict(agent),
-            "rnd_predictor": _cpu_state_dict(rnd_model.predictor),
-            "rnd_target": _cpu_state_dict(rnd_model.target),
+            "world_model": _cpu_state_dict(world_model),
+            "neural_critic": _cpu_state_dict(neural_critic),
             "obs_rms_mean": obs_rms.mean,
             "obs_rms_var": obs_rms.var,
             "reward_rms_mean": reward_rms.mean,
@@ -563,8 +721,8 @@ if __name__ == "__main__":
         }
         torch.save(checkpoint, model_paths["checkpoint"])
         torch.save(checkpoint["policy_model"], model_paths["policy_model"])
-        torch.save(checkpoint["rnd_predictor"], model_paths["rnd_predictor"])
-        torch.save(checkpoint["rnd_target"], model_paths["rnd_target"])
+        torch.save(checkpoint["world_model"], model_paths["world_model"])
+        torch.save(checkpoint["neural_critic"], model_paths["neural_critic"])
         for model_path in model_paths.values():
             print(f"model saved to {model_path}")
             if args.track:
