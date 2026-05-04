@@ -36,6 +36,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = False
+    """if toggled, saves the final policy, RND predictor, and RND target weights"""
 
     # Algorithm specific arguments
     env_id: str = "MontezumaRevenge-v5"
@@ -240,6 +242,10 @@ class RewardForwardFilter:
         else:
             self.rewems = self.rewems * self.gamma + rews
         return self.rewems
+
+
+def _cpu_state_dict(module):
+    return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
 if __name__ == "__main__":
@@ -534,6 +540,35 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        model_dir = f"runs/{run_name}"
+        os.makedirs(model_dir, exist_ok=True)
+        model_paths = {
+            "checkpoint": f"{model_dir}/{args.exp_name}.cleanrl_model",
+            "policy_model": f"{model_dir}/policy_model.pt",
+            "rnd_predictor": f"{model_dir}/rnd_predictor.pt",
+            "rnd_target": f"{model_dir}/rnd_target.pt",
+        }
+        checkpoint = {
+            "args": vars(args),
+            "global_step": global_step,
+            "policy_model": _cpu_state_dict(agent),
+            "rnd_predictor": _cpu_state_dict(rnd_model.predictor),
+            "rnd_target": _cpu_state_dict(rnd_model.target),
+            "obs_rms_mean": obs_rms.mean,
+            "obs_rms_var": obs_rms.var,
+            "reward_rms_mean": reward_rms.mean,
+            "reward_rms_var": reward_rms.var,
+        }
+        torch.save(checkpoint, model_paths["checkpoint"])
+        torch.save(checkpoint["policy_model"], model_paths["policy_model"])
+        torch.save(checkpoint["rnd_predictor"], model_paths["rnd_predictor"])
+        torch.save(checkpoint["rnd_target"], model_paths["rnd_target"])
+        for model_path in model_paths.values():
+            print(f"model saved to {model_path}")
+            if args.track:
+                wandb.save(model_path)
 
     envs.close()
     writer.close()

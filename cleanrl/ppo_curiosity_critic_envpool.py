@@ -51,6 +51,8 @@ class Args:
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = False
+    """if toggled, saves the final policy, World Model, and Neural Critic weights"""
 
     # Algorithm specific arguments
     env_id: str = "MontezumaRevenge-v5"
@@ -306,6 +308,10 @@ def _rnd_reward_error_per_sample(pred, target):
 def _rnd_update_loss_per_sample(pred, target):
     """Auxiliary-model update metric, matching RND's per-sample MSE."""
     return F.mse_loss(pred, target, reduction="none").flatten(1).mean(1)
+
+
+def _cpu_state_dict(module):
+    return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
 if __name__ == "__main__":
@@ -667,6 +673,35 @@ if __name__ == "__main__":
         writer.add_scalar("charts/critic_pred_mean", curiosity_critic_pred_sum / max(n_minibatch_steps, 1), global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if args.save_model:
+        model_dir = f"runs/{run_name}"
+        os.makedirs(model_dir, exist_ok=True)
+        model_paths = {
+            "checkpoint": f"{model_dir}/{args.exp_name}.cleanrl_model",
+            "policy_model": f"{model_dir}/policy_model.pt",
+            "world_model": f"{model_dir}/world_model.pt",
+            "neural_critic": f"{model_dir}/neural_critic.pt",
+        }
+        checkpoint = {
+            "args": vars(args),
+            "global_step": global_step,
+            "policy_model": _cpu_state_dict(agent),
+            "world_model": _cpu_state_dict(world_model),
+            "neural_critic": _cpu_state_dict(neural_critic),
+            "obs_rms_mean": obs_rms.mean,
+            "obs_rms_var": obs_rms.var,
+            "reward_rms_mean": reward_rms.mean,
+            "reward_rms_var": reward_rms.var,
+        }
+        torch.save(checkpoint, model_paths["checkpoint"])
+        torch.save(checkpoint["policy_model"], model_paths["policy_model"])
+        torch.save(checkpoint["world_model"], model_paths["world_model"])
+        torch.save(checkpoint["neural_critic"], model_paths["neural_critic"])
+        for model_path in model_paths.values():
+            print(f"model saved to {model_path}")
+            if args.track:
+                wandb.save(model_path)
 
     envs.close()
     writer.close()

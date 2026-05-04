@@ -28,6 +28,7 @@ run_cleanrl() {
         --env-id "${ENV_ID}"
         --seed "${seed}"
         --track
+        --save-model
         --wandb-project-name "${WANDB_PROJECT_NAME}"
     )
 

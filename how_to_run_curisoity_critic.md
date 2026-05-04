@@ -82,7 +82,7 @@ The simplest full run is the flat no-args script:
 bash benchmark/rnd_curiosity-critic_compare_no_args.sh
 ```
 
-This script intentionally has no loops, no environment variables, and no command-line arguments. It runs six commands one after another:
+This script intentionally has no loops, no environment variables, and no command-line arguments. It runs six 100M-step commands one after another:
 
 1. Curiosity-Critic seed 1
 2. RND seed 1
@@ -91,7 +91,14 @@ This script intentionally has no loops, no environment variables, and no command
 5. Curiosity-Critic seed 3
 6. RND seed 3
 
-It resembles `benchmark/rnd.sh` and `benchmark/curiosity_critic.sh`: each line calls `python -m cleanrl_utils.benchmark` with one seed and one worker. Because the file is no-args, it uses each training script's default W&B project name, `cleanRL`, unless you edit the six command strings directly.
+It resembles `benchmark/rnd.sh` and `benchmark/curiosity_critic.sh`: each line calls `python -m cleanrl_utils.benchmark` with one seed and one worker. Each command explicitly includes `--total-timesteps 100000000`. Because the file is no-args, it uses each training script's default W&B project name, `cleanRL`, unless you edit the six command strings directly.
+
+All benchmark scripts now pass `--save-model`. At the end of each run, final weights are saved under that run's TensorBoard directory:
+
+- RND: `runs/<run_name>/ppo_rnd_envpool.cleanrl_model`, `policy_model.pt`, `rnd_predictor.pt`, `rnd_target.pt`
+- Curiosity-Critic: `runs/<run_name>/ppo_curiosity_critic_envpool.cleanrl_model`, `policy_model.pt`, `world_model.pt`, `neural_critic.pt`
+
+When `--track` is enabled, these files are also registered with W&B via `wandb.save(...)`.
 
 For smoke tests, custom W&B project names, custom entities, or shorter debugging runs, use the configurable script instead:
 
