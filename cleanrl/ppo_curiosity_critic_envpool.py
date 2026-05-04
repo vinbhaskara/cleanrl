@@ -205,38 +205,51 @@ def _action_planes(action_onehot, height, width):
 
 class ForwardCNN(nn.Module):
     """
-    Fully convolutional action-conditioned World Model (WM).
+    Action-conditioned U-Net World Model (WM).
 
     The one-hot action is broadcast as extra spatial channels and concatenated
-    with the normalized frame stack. A conv encoder and transposed-conv decoder
-    predict the normalized next 84x84 frame.
+    with the normalized frame stack. The encoder downsamples to a 7x7 bottleneck,
+    the decoder upsamples back to 84x84, and skip connections preserve spatial
+    detail for next-frame prediction.
     """
 
-    # Default channels give 2,203,337 trainable params for 18-action Atari,
-    # matching RND's 2,203,296-param predictor within 0.002%.
-    def __init__(self, num_actions, frame_stack=4, channels=(184, 240, 120)):
+    def __init__(self, num_actions, frame_stack=4, channels=(64, 128, 256)):
         super().__init__()
         c1, c2, c3 = channels
         self.num_actions = num_actions
-        self.encoder = nn.Sequential(
+        self.down1 = nn.Sequential(
             layer_init(
                 nn.Conv2d(in_channels=frame_stack + num_actions, out_channels=c1, kernel_size=8, stride=4)
             ),
             nn.LeakyReLU(),
+        )
+        self.down2 = nn.Sequential(
             layer_init(nn.Conv2d(in_channels=c1, out_channels=c2, kernel_size=4, stride=2)),
             nn.LeakyReLU(),
+        )
+        self.bottleneck = nn.Sequential(
             layer_init(nn.Conv2d(in_channels=c2, out_channels=c3, kernel_size=3, stride=1)),
             nn.LeakyReLU(),
         )
-        self.decoder = nn.Sequential(
+        self.up2 = nn.Sequential(
             layer_init(
                 nn.ConvTranspose2d(in_channels=c3, out_channels=c2, kernel_size=3, stride=1)
             ),
             nn.LeakyReLU(),
-            layer_init(
-                nn.ConvTranspose2d(in_channels=c2, out_channels=c1, kernel_size=4, stride=2)
-            ),
+        )
+        self.fuse2 = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c2 * 2, out_channels=c2, kernel_size=3, stride=1, padding=1)),
             nn.LeakyReLU(),
+        )
+        self.up1 = nn.Sequential(
+            layer_init(nn.ConvTranspose2d(in_channels=c2, out_channels=c1, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+        )
+        self.fuse1 = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels=c1 * 2, out_channels=c1, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+        )
+        self.out = nn.Sequential(
             layer_init(
                 nn.ConvTranspose2d(in_channels=c1, out_channels=1, kernel_size=8, stride=4)
             ),
@@ -246,7 +259,15 @@ class ForwardCNN(nn.Module):
         _, _, height, width = obs_stack.shape
         action_map = _action_planes(action_onehot, height, width)
         h = torch.cat([obs_stack, action_map], dim=1)
-        return self.decoder(self.encoder(h))
+        skip1 = self.down1(h)
+        skip2 = self.down2(skip1)
+        bottleneck = self.bottleneck(skip2)
+
+        up2 = self.up2(bottleneck)
+        up2 = self.fuse2(torch.cat([up2, skip2], dim=1))
+        up1 = self.up1(up2)
+        up1 = self.fuse1(torch.cat([up1, skip1], dim=1))
+        return self.out(up1)
 
 
 class CuriosityCriticCNN(nn.Module):
@@ -254,25 +275,29 @@ class CuriosityCriticCNN(nn.Module):
     Action-conditioned Neural Critic (NC) for the scalar error baseline.
 
     The NC is trained on the same masked PPO minibatches as the WM, after the WM
-    step, to predict the post-update RND-style WM error for each transition.
+    step, to predict the post-update RND-style WM error for each transition. Its
+    conv/MLP layout mirrors RND's predictor, with state-action input channels
+    and a scalar output instead of a 512-d feature output.
     """
 
-    # Default channels give 1,677,969 trainable params for 18-action Atari,
-    # matching RND's 1,677,984-param target within 0.001%.
-    def __init__(self, num_actions, frame_stack=4, channels=(184, 232, 344)):
+    def __init__(self, num_actions, frame_stack=4):
         super().__init__()
-        c1, c2, c3 = channels
+        feature_output = 7 * 7 * 64
         self.encoder = nn.Sequential(
             layer_init(
-                nn.Conv2d(in_channels=frame_stack + num_actions, out_channels=c1, kernel_size=8, stride=4)
+                nn.Conv2d(in_channels=frame_stack + num_actions, out_channels=32, kernel_size=8, stride=4)
             ),
             nn.LeakyReLU(),
-            layer_init(nn.Conv2d(in_channels=c1, out_channels=c2, kernel_size=4, stride=2)),
+            layer_init(nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2)),
             nn.LeakyReLU(),
-            layer_init(nn.Conv2d(in_channels=c2, out_channels=c3, kernel_size=3, stride=1)),
+            layer_init(nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1)),
             nn.LeakyReLU(),
-            layer_init(nn.Conv2d(in_channels=c3, out_channels=1, kernel_size=7, stride=1)),
             nn.Flatten(),
+            layer_init(nn.Linear(feature_output, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 1)),
         )
 
     def forward(self, obs_stack, action_onehot):

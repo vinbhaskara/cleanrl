@@ -180,9 +180,9 @@ Secondary reporting:
 - Report `charts/SPS` or total wall-clock because Curiosity-Critic trains an additional NC.
 - Report auxiliary parameter counts:
   - RND predictor trainable params: about `2.203M`
-  - Curiosity-Critic WM trainable params: about `2.203M`
   - RND target params: about `1.678M` frozen
-  - Curiosity-Critic NC trainable params: about `1.678M`
+  - Curiosity-Critic WM trainable params: about `1.316M`
+  - Curiosity-Critic NC trainable params: about `1.984M`
 
 Recommended conclusion rule:
 
