@@ -163,6 +163,10 @@ class Args:
     """if toggled, build ONE real VizDoom env, validate the obs/reward/nets path, and exit (no training)"""
     preflight_steps: int = 20
     """number of random steps to take during the preflight check"""
+    probe_maze: bool = False
+    """if toggled, drive a forward-biased policy to estimate maze extent, recommend --tv-radius, and exit"""
+    probe_maze_steps: int = 3000
+    """number of steps for the maze-extent probe"""
 
     # to be filled in at runtime
     batch_size: int = 0
@@ -760,6 +764,44 @@ def run_preflight(args: "Args"):
     print(line)
 
 
+def run_probe_maze(args: "Args"):
+    """Drive a forward-biased policy to estimate the maze extent and recommend --tv-radius.
+
+    The noisy-TV zone is a disk of radius --tv-radius around the episode start. For a
+    meaningful trap the zone must be localized (the agent starts inside it but can
+    escape toward a noise-free path to the vest). This probe measures how far the
+    agent travels from start so the radius can be sized to ~the starting region
+    instead of guessed.
+    """
+    line = "=" * 72
+    print(line)
+    print(f"PROBE-MAZE  scenario={args.scenario}  (sizing --tv-radius)")
+    print(line)
+    rng = np.random.default_rng(args.seed)
+    env = make_env(args, idx=0, seed=args.seed, expose_rgb=False)()
+    _, info = env.reset(seed=args.seed)
+    sx, sy = float(info.get("position_x", 0.0)), float(info.get("position_y", 0.0))
+    xs, ys = [], []
+    for t in range(args.probe_maze_steps):
+        a = 2 if (t % 4 != 0) else int(rng.integers(0, 3))  # mostly MOVE_FORWARD (idx 2), occasional turn
+        _, _, term, trunc, info = env.step(a)
+        xs.append(float(info.get("position_x", sx)))
+        ys.append(float(info.get("position_y", sy)))
+        if term or trunc:
+            env.reset()
+    env.close()
+    xs, ys = np.array(xs), np.array(ys)
+    d = np.sqrt((xs - sx) ** 2 + (ys - sy) ** 2)
+    in_zone = float(np.mean(d <= args.tv_radius))
+    p40 = float(np.percentile(d, 40))
+    print(f"start = ({sx:.0f}, {sy:.0f})")
+    print(f"x range = [{xs.min():.0f}, {xs.max():.0f}]   y range = [{ys.min():.0f}, {ys.max():.0f}]")
+    print(f"distance from start over walk: max={d.max():.0f}  median={np.median(d):.0f}")
+    print(f"current --tv-radius={args.tv_radius:.0f}  ->  in-zone fraction over this walk = {in_zone:.2f}")
+    print(f"SUGGESTED --tv-radius ~ {p40:.0f}  (agent in TV zone ~40% of exploratory time: visitable but escapable)")
+    print(line)
+
+
 # ----------------------------------------------------------------------------- #
 #  Main
 # ----------------------------------------------------------------------------- #
@@ -773,6 +815,9 @@ if __name__ == "__main__":
 
     if args.preflight:
         run_preflight(args)
+        sys.exit(0)
+    if args.probe_maze:
+        run_probe_maze(args)
         sys.exit(0)
 
     # Capability switches derived from the chosen method.
