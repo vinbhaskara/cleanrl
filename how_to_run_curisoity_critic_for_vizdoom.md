@@ -22,7 +22,9 @@ Two conditions, selected with `--noisy-tv`:
 - **noisy-tv** (`--noisy-tv`): same maze + a visitable noise panel painted into the
   observation while the agent is within `--tv-radius` of its episode start. This is
   the noisy-TV trap that raw prediction-error methods fall into and Curiosity-Critic
-  is designed to escape.
+  is designed to escape. The default `--tv-radius 150` was calibrated for MyWayHome
+  sparse via `--probe-maze` (maze max reach ~516): a localized start-region zone the
+  agent starts inside but can leave, keeping the far rooms / goal noise-free.
 
 ---
 
@@ -35,7 +37,7 @@ sudo apt update
 sudo apt install -y cmake git libboost-all-dev libsdl2-dev libopenal-dev tmux
 
 # in your cleanrl venv
-pip install vizdoom opencv-python "imageio[ffmpeg]" matplotlib
+pip install vizdoom opencv-python matplotlib
 ```
 
 The training stack (`torch`, `gymnasium>=1.0`, `tyro`, `tensorboard`, `wandb`) is

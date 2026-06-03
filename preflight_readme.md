@@ -32,7 +32,6 @@ PREFLIGHT  method=cc  scenario=sparse  noisy_tv=True
 [ok] import vizdoom
 [ok] import cv2
 [ok] import matplotlib (visualization)
-[ok] import imageio (visualization)
 [env] building VizDoomEnv (map=map01, wad_dir=./vizdoom_scenarios) ...
 [ok] obs (4, 84, 84) uint8; n_actions=3; rgb (120, 160, 3)
 [ok] start position=(...)

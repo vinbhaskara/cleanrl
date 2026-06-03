@@ -143,8 +143,8 @@ class Args:
     # Noisy-TV condition arguments
     noisy_tv: bool = False
     """if toggled, paint a noise panel into the observation inside the TV zone"""
-    tv_radius: float = 100.0
-    """the agent is in the TV zone when within this distance (game units) of its episode start"""
+    tv_radius: float = 150.0
+    """TV-zone radius (game units) around episode start; calibrated via --probe-maze for MyWayHome sparse (max reach ~516)"""
     tv_panel: int = 42
     """side length (pixels, in the 84x84 frame) of the square noise panel"""
 
@@ -643,9 +643,13 @@ def save_heatmaps(path, xs, ys, intr, in_tv, bins=40):
 
 @torch.no_grad()
 def capture_video(path, args, agent, device, seed):
-    """Roll out the current policy in a fresh single env and write an mp4."""
+    """Roll out the current policy in a fresh single env and write an mp4 via OpenCV.
+
+    Uses cv2.VideoWriter (cv2 is already a hard dependency) instead of imageio to
+    avoid imageio/imageio-ffmpeg version mismatches.
+    """
     try:
-        import imageio
+        import cv2
 
         env = make_env(args, idx=0, seed=seed + 999, expose_rgb=True)()
         obs, _ = env.reset()
@@ -658,7 +662,16 @@ def capture_video(path, args, agent, device, seed):
             if term or trunc:
                 obs, _ = env.reset()
         env.close()
-        imageio.mimsave(path, frames, fps=30)
+        if not frames:
+            return None
+        height, width = frames[0].shape[:2]
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (width, height))
+        if not writer.isOpened():
+            print("[viz] video skipped: cv2.VideoWriter failed to open (mp4v codec unavailable)")
+            return None
+        for frame in frames:
+            writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
+        writer.release()
         return path
     except Exception as exc:  # pragma: no cover
         print(f"[viz] video skipped: {exc}")
@@ -690,12 +703,11 @@ def run_preflight(args: "Args"):
     for mod in ("vizdoom", "cv2"):
         importlib.import_module(mod)  # hard requirement: let ImportError surface loudly
         print(f"[ok] import {mod}")
-    for mod in ("matplotlib", "imageio"):
-        try:
-            importlib.import_module(mod)
-            print(f"[ok] import {mod} (visualization)")
-        except Exception as exc:
-            print(f"[warn] {mod} missing -> visualization will be skipped: {exc}")
+    try:
+        importlib.import_module("matplotlib")
+        print("[ok] import matplotlib (visualization)")
+    except Exception as exc:
+        print(f"[warn] matplotlib missing -> heatmaps/WM panels will be skipped: {exc}")
 
     print(f"\n[env] building VizDoomEnv (map={args.doom_map}, wad_dir={args.wad_dir}) ...")
     env = make_env(args, idx=0, seed=args.seed, expose_rgb=True)()
@@ -793,12 +805,15 @@ def run_probe_maze(args: "Args"):
     xs, ys = np.array(xs), np.array(ys)
     d = np.sqrt((xs - sx) ** 2 + (ys - sy) ** 2)
     in_zone = float(np.mean(d <= args.tv_radius))
-    p40 = float(np.percentile(d, 40))
+    suggested = 0.3 * float(d.max())
     print(f"start = ({sx:.0f}, {sy:.0f})")
     print(f"x range = [{xs.min():.0f}, {xs.max():.0f}]   y range = [{ys.min():.0f}, {ys.max():.0f}]")
     print(f"distance from start over walk: max={d.max():.0f}  median={np.median(d):.0f}")
     print(f"current --tv-radius={args.tv_radius:.0f}  ->  in-zone fraction over this walk = {in_zone:.2f}")
-    print(f"SUGGESTED --tv-radius ~ {p40:.0f}  (agent in TV zone ~40% of exploratory time: visitable but escapable)")
+    print(
+        f"SUGGESTED --tv-radius ~ {suggested:.0f}  (~30% of max reach {d.max():.0f}: a localized start-region "
+        f"TV the agent starts inside but can leave, keeping the far rooms / goal noise-free)"
+    )
     print(line)
 
 

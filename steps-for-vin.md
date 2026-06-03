@@ -57,7 +57,7 @@ git pull
 sudo apt update
 sudo apt install -y cmake git libboost-all-dev libsdl2-dev libopenal-dev tmux
 # in your cleanrl venv:
-pip install vizdoom opencv-python "imageio[ffmpeg]" matplotlib
+pip install vizdoom opencv-python matplotlib
 ls vizdoom_scenarios/   # expect the 3 my_way_home_*.wad files (bundled in the repo)
 ```
 
@@ -70,8 +70,11 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py --preflight --method rnd --scenar
 
 - Both must end with `PREFLIGHT PASSED`.
 - If anything fails, see `preflight_readme.md` (map name, tv-radius, deps fixes).
-- Tune `--tv-radius` here if the `[tv]` line warns; whatever value you settle on,
-  reuse it in every later command.
+- `--tv-radius` default is **150**, calibrated for MyWayHome sparse via
+  `python cleanrl/ppo_curiosity_critic_vizdoom.py --probe-maze --scenario sparse`
+  (maze max reach ~516). Verify the trap behaviorally from the first noisy-TV
+  runs' heatmaps (V1/RND should dwell in the TV zone; CC should leave) and adjust
+  only if needed.
 
 **Gate: do not proceed until both preflights pass.**
 
