@@ -37,6 +37,7 @@
 # and periodic gameplay videos.
 import os
 import random
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -155,6 +156,12 @@ class Args:
     """dump visitation / intrinsic-reward heatmaps every N updates (0 disables)"""
     video_steps: int = 525
     """number of agent steps to roll out when recording a video"""
+
+    # Preflight self-test
+    preflight: bool = False
+    """if toggled, build ONE real VizDoom env, validate the obs/reward/nets path, and exit (no training)"""
+    preflight_steps: int = 20
+    """number of random steps to take during the preflight check"""
 
     # to be filled in at runtime
     batch_size: int = 0
@@ -645,6 +652,105 @@ def capture_video(path, args, agent, device, seed):
 
 
 # ----------------------------------------------------------------------------- #
+#  Preflight self-test (fast, single env, no training)
+# ----------------------------------------------------------------------------- #
+def run_preflight(args: "Args"):
+    """Validate the VizDoom integration on real data in ~30 seconds.
+
+    Builds one real env (full wrapper stack), steps random actions, and runs a
+    forward pass of the chosen method's networks on the collected observations.
+    Surfaces the first-run unknowns (map name, screen format, reward, tv-radius,
+    API/version drift, missing deps) with a clear PASS/FAIL before any GPU-days
+    are spent on the full training matrix.
+    """
+    line = "=" * 72
+    print(line)
+    print(f"PREFLIGHT  method={args.method}  scenario={args.scenario}  noisy_tv={args.noisy_tv}")
+    print(line)
+    np.random.seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    print(f"[ok] torch device = {device}")
+
+    import importlib
+
+    for mod in ("vizdoom", "cv2"):
+        importlib.import_module(mod)  # hard requirement: let ImportError surface loudly
+        print(f"[ok] import {mod}")
+    for mod in ("matplotlib", "imageio"):
+        try:
+            importlib.import_module(mod)
+            print(f"[ok] import {mod} (visualization)")
+        except Exception as exc:
+            print(f"[warn] {mod} missing -> visualization will be skipped: {exc}")
+
+    print(f"\n[env] building VizDoomEnv (map={args.doom_map}, wad_dir={args.wad_dir}) ...")
+    env = make_env(args, idx=0, seed=args.seed, expose_rgb=True)()
+    obs, info = env.reset(seed=args.seed)
+    obs = np.asarray(obs)
+    assert obs.shape == (4, 84, 84), f"expected obs (4,84,84), got {obs.shape}"
+    assert obs.dtype == np.uint8, f"expected uint8 obs, got {obs.dtype}"
+    n_actions = int(env.action_space.n)
+    rgb = np.asarray(info.get("rgb"))
+    print(f"[ok] obs {obs.shape} {obs.dtype}; n_actions={n_actions}; rgb {rgb.shape}")
+    print(f"[ok] start position=({info.get('position_x', 0.0):.1f}, {info.get('position_y', 0.0):.1f})")
+
+    rewards, tv_hits, term_seen = [], 0, False
+    last_obs, last_next, last_action = obs, obs[3], 0
+    for _ in range(args.preflight_steps):
+        a = int(np.random.randint(0, n_actions))
+        nobs, r, term, trunc, info = env.step(a)
+        nobs = np.asarray(nobs)
+        rewards.append(float(r))
+        last_obs, last_next, last_action = obs, nobs[3], a
+        obs = nobs
+        if info.get("in_tv_zone"):
+            tv_hits += 1
+        if term or trunc:
+            term_seen = True
+            obs, info = env.reset()
+            obs = np.asarray(obs)
+    env.close()
+    print(f"[ok] stepped {args.preflight_steps} actions; reward range=[{min(rewards):.5f}, {max(rewards):.5f}]; episode-end seen={term_seen}")
+    if args.noisy_tv:
+        frac = tv_hits / args.preflight_steps
+        print(f"[tv] in_tv_zone fraction = {frac:.2f} (tv_radius={args.tv_radius}, tv_panel={args.tv_panel})")
+        if frac == 0.0:
+            print("[warn] never inside TV zone -> increase --tv-radius (the start room should register as the zone)")
+        elif frac == 1.0:
+            print("[warn] always inside TV zone -> --tv-radius may be too large for random-walk steps")
+
+    print(f"\n[nets] forward pass for method={args.method} on real obs ...")
+    o0 = torch.tensor(last_obs[None], dtype=torch.float32, device=device)
+    ah = F.one_hot(torch.tensor([last_action], device=device), n_actions).float()
+    agent = Agent(n_actions).to(device)
+    with torch.no_grad():
+        act, _, _, ve, vi = agent.get_action_and_value(o0)
+    print(f"[ok] agent: action={int(act.item())} value_ext={float(ve.item()):.3f} value_int={float(vi.item()):.3f}")
+    if args.method in {"c_v1", "c_v2", "cc"}:
+        wm = ForwardCNN(n_actions).to(device)
+        with torch.no_grad():
+            pred = wm(o0, ah)
+        assert pred.shape == (1, 1, 84, 84), f"WM output {pred.shape}"
+        print(f"[ok] world model: output {tuple(pred.shape)}")
+        if args.method == "cc":
+            nc = CuriosityCriticCNN(n_actions).to(device)
+            with torch.no_grad():
+                base = nc(o0, ah)
+            print(f"[ok] neural critic: output {tuple(base.shape)} baseline={float(base.item()):.3f}")
+    if args.method == "rnd":
+        rnd = RNDModel().to(device)
+        nf = torch.tensor(last_next[None, None], dtype=torch.float32, device=device)
+        with torch.no_grad():
+            pf, tf = rnd(nf)
+        print(f"[ok] RND: predictor {tuple(pf.shape)} target {tuple(tf.shape)}")
+
+    print("\n" + line)
+    print("PREFLIGHT PASSED  -  env, obs pipeline, and nets all work on real VizDoom data.")
+    print("Next: Phase-0 smoke test (see how_to_run_curisoity_critic_for_vizdoom.md).")
+    print(line)
+
+
+# ----------------------------------------------------------------------------- #
 #  Main
 # ----------------------------------------------------------------------------- #
 if __name__ == "__main__":
@@ -654,6 +760,10 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
+    if args.preflight:
+        run_preflight(args)
+        sys.exit(0)
 
     # Capability switches derived from the chosen method.
     use_intrinsic = args.method in {"c_v1", "c_v2", "rnd", "cc"}
