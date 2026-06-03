@@ -35,6 +35,7 @@
 # episode-return / curiosity scalars, WM-prediction image panels, position
 # visitation + intrinsic-reward heatmaps (from VizDoom POSITION game variables),
 # and periodic gameplay videos.
+import functools
 import os
 import random
 import sys
@@ -325,16 +326,25 @@ class NoisyTVWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-def make_env(args: "Args", idx: int, seed: int, expose_rgb: bool = False):
-    def thunk():
-        env = VizDoomEnv(args, idx=idx, seed=seed, expose_rgb=expose_rgb)
-        if args.noisy_tv:
-            env = NoisyTVWrapper(env, tv_radius=args.tv_radius, tv_panel=args.tv_panel, rng_seed=seed)
-        env = gym.wrappers.FrameStackObservation(env, stack_size=4)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        return env
+def _frame_stack(env, k=4):
+    # gymnasium >=1.0 renamed FrameStack -> FrameStackObservation (and the kwarg).
+    if hasattr(gym.wrappers, "FrameStackObservation"):
+        return gym.wrappers.FrameStackObservation(env, stack_size=k)
+    return gym.wrappers.FrameStack(env, num_stack=k)
 
-    return thunk
+
+def _build_single_env(args: "Args", idx: int, seed: int, expose_rgb: bool = False):
+    env = VizDoomEnv(args, idx=idx, seed=seed, expose_rgb=expose_rgb)
+    if args.noisy_tv:
+        env = NoisyTVWrapper(env, tv_radius=args.tv_radius, tv_panel=args.tv_panel, rng_seed=seed)
+    env = _frame_stack(env, 4)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    return env
+
+
+def make_env(args: "Args", idx: int, seed: int, expose_rgb: bool = False):
+    # functools.partial of a module-level builder is picklable for AsyncVectorEnv "spawn".
+    return functools.partial(_build_single_env, args, idx, seed, expose_rgb)
 
 
 # ----------------------------------------------------------------------------- #
@@ -870,20 +880,31 @@ if __name__ == "__main__":
         next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
 
     def log_episode_infos(infos, curiosity_step_mean):
-        if "episode" not in infos:
-            return
-        ep = infos["episode"]
-        mask = infos.get("_episode", ep.get("_r"))
-        finished = np.asarray(ep["r"])
-        lengths = np.asarray(ep["l"])
-        idxs = range(len(finished)) if mask is None else np.where(np.asarray(mask))[0]
-        for i in idxs:
-            avg_returns.append(float(finished[i]))
+        # gymnasium 1.x: infos["episode"] (dict of arrays) + "_episode" mask
+        # gymnasium 0.29: infos["final_info"] (array of per-env dicts/None), episode r/l are arrays
+        pairs = []
+        if "episode" in infos:
+            ep = infos["episode"]
+            mask = infos.get("_episode", ep.get("_r"))
+            rs, ls = np.asarray(ep["r"]).reshape(-1), np.asarray(ep["l"]).reshape(-1)
+            idxs = range(len(rs)) if mask is None else np.where(np.asarray(mask))[0]
+            pairs = [(float(rs[i]), float(ls[i])) for i in idxs]
+        elif "final_info" in infos:
+            for fi in infos["final_info"]:
+                if fi is not None and "episode" in fi:
+                    pairs.append(
+                        (
+                            float(np.asarray(fi["episode"]["r"]).reshape(-1)[0]),
+                            float(np.asarray(fi["episode"]["l"]).reshape(-1)[0]),
+                        )
+                    )
+        for r, length in pairs:
+            avg_returns.append(r)
             writer.add_scalar("charts/avg_episodic_return", float(np.mean(avg_returns)), global_step)
-            writer.add_scalar("charts/episodic_return", float(finished[i]), global_step)
-            writer.add_scalar("charts/episodic_length", float(lengths[i]), global_step)
+            writer.add_scalar("charts/episodic_return", r, global_step)
+            writer.add_scalar("charts/episodic_length", length, global_step)
             writer.add_scalar("charts/episode_curiosity_reward", curiosity_step_mean, global_step)
-            print(f"global_step={global_step}, episodic_return={float(finished[i]):.3f}")
+            print(f"global_step={global_step}, episodic_return={r:.3f}")
 
     for update in range(1, args.num_iterations + 1):
         if args.anneal_lr:
