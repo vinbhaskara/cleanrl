@@ -41,11 +41,11 @@ pip install vizdoom opencv-python "imageio[ffmpeg]" matplotlib
 The training stack (`torch`, `gymnasium>=1.0`, `tyro`, `tensorboard`, `wandb`) is
 already installed for the existing cleanrl scripts.
 
-Confirm the scenario wads are present (they ship in the cloned `noreward-rl` repo,
-which is the default `--wad-dir`):
+Confirm the scenario wads are present (they are bundled in the repo at the
+default `--wad-dir ./vizdoom_scenarios`):
 
 ```bash
-ls noreward-rl/doomFiles/wads/
+ls vizdoom_scenarios/
 # my_way_home_sparse.wad  my_way_home_verySparse.wad  my_way_home_dense.wad
 ```
 
@@ -81,7 +81,7 @@ Check the console and `runs/<run_name>/`:
 - **`runs/<run_name>/videos/*.mp4`** plays the agent in the maze.
 
 Map-name check: if VizDoom errors on the map, list it with
-`python -c "import vizdoom,os; g=vizdoom.DoomGame(); g.set_doom_scenario_path('noreward-rl/doomFiles/wads/my_way_home_sparse.wad'); print('ok')"`
+`python -c "import vizdoom,os; g=vizdoom.DoomGame(); g.set_doom_scenario_path('vizdoom_scenarios/my_way_home_sparse.wad'); print('ok')"`
 and pass the correct `--doom-map` (default `map01`).
 
 Noisy-TV tuning: open a heatmap/video. The TV zone should cover roughly the

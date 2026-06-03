@@ -24,13 +24,24 @@ Order: **preflight → smoke test → Phases 1–3.**
 
 ## Step 0 — Get the branch onto the box
 
-From your **Mac** (where the preflight edits live, uncommitted):
+From your **Mac** (where the preflight edits live, uncommitted). Stage only the
+VizDoom work explicitly — `git add -A` would also pull in `paper/` (LaTeX +
+build artifacts) and is avoided on purpose:
 
 ```bash
-git add -A
-git commit -m "Add VizDoom preflight self-test + docs"
+git add .gitignore \
+        cleanrl/ppo_curiosity_critic_vizdoom.py \
+        how_to_run_curisoity_critic_for_vizdoom.md \
+        preflight_readme.md \
+        steps-for-vin.md \
+        vizdoom_scenarios/
+git commit -m "Add VizDoom preflight self-test, bundle MyWayHome scenarios, docs"
 git push -u origin vin/cc-vizdoom-preflight
 ```
+
+The upstream clones (`noreward-rl/`, `large-scale-curiosity/`) are gitignored so
+they won't be committed. `paper/` is intentionally left out — handle it
+separately if you want it tracked here.
 
 On the **Linux 3090 box**:
 
@@ -47,7 +58,7 @@ sudo apt update
 sudo apt install -y cmake git libboost-all-dev libsdl2-dev libopenal-dev tmux
 # in your cleanrl venv:
 pip install vizdoom opencv-python "imageio[ffmpeg]" matplotlib
-ls noreward-rl/doomFiles/wads/   # expect the 3 my_way_home_*.wad files
+ls vizdoom_scenarios/   # expect the 3 my_way_home_*.wad files (bundled in the repo)
 ```
 
 ## Step 2 — PREFLIGHT (the fast gate)  ← run this first

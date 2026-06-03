@@ -33,7 +33,7 @@ PREFLIGHT  method=cc  scenario=sparse  noisy_tv=True
 [ok] import cv2
 [ok] import matplotlib (visualization)
 [ok] import imageio (visualization)
-[env] building VizDoomEnv (map=map01, wad_dir=./noreward-rl/doomFiles/wads) ...
+[env] building VizDoomEnv (map=map01, wad_dir=./vizdoom_scenarios) ...
 [ok] obs (4, 84, 84) uint8; n_actions=3; rgb (120, 160, 3)
 [ok] start position=(...)
 [ok] stepped 20 actions; reward range=[...]; episode-end seen=False
@@ -56,7 +56,7 @@ smoke test.
 |---|---|---|
 | `ModuleNotFoundError: vizdoom` / `cv2` | deps not installed | `pip install vizdoom opencv-python` (see how-to §1) |
 | Error during "building VizDoomEnv" mentioning the map | the map lump in the wad is not `map01` | inspect the wad / try `--doom-map map00` etc.; pass the right `--doom-map` |
-| `FileNotFoundError: scenario wad not found` | wrong `--wad-dir` | point `--wad-dir` at `noreward-rl/doomFiles/wads` |
+| `FileNotFoundError: scenario wad not found` | wrong `--wad-dir` | wads are bundled in `vizdoom_scenarios/` (the default); pass `--wad-dir ./vizdoom_scenarios` if running from elsewhere |
 | `AssertionError: expected obs (4,84,84)` | screen buffer shape mismatch | report it — the resize/convert path needs adjusting for your VizDoom version |
 | `[warn] never inside TV zone` | `--tv-radius` too small | raise `--tv-radius` (game units) until the start room registers |
 | `[warn] always inside TV zone` | `--tv-radius` too large | lower `--tv-radius` |

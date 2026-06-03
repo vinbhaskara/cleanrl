@@ -126,8 +126,8 @@ class Args:
     # VizDoom environment arguments
     scenario: str = "sparse"
     """MyWayHome scenario: one of {sparse, very_sparse, dense}"""
-    wad_dir: str = "./noreward-rl/doomFiles/wads"
-    """directory holding the my_way_home_*.wad scenario files"""
+    wad_dir: str = "./vizdoom_scenarios"
+    """directory holding the my_way_home_*.wad scenario files (bundled in the repo)"""
     doom_map: str = "map01"
     """the map name inside the scenario wad"""
     frame_skip: int = 4
