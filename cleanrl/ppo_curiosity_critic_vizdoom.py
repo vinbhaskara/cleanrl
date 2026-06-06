@@ -124,7 +124,7 @@ class Args:
     """coefficient of the extrinsic reward"""
     int_gamma: float = 0.99
     """Intrinsic reward discount rate"""
-    num_iterations_obs_norm_init: int = 10
+    num_iterations_obs_norm_init: int = 50
     """number of rollouts of random data used to initialize observation normalization"""
 
     # VizDoom environment arguments
@@ -727,6 +727,20 @@ def load_wad_map_lines(wad_path, doom_map="map01"):
     return lines
 
 
+def load_wad_vest_positions(wad_path, doom_map="map01"):
+    """Return vest/goal thing positions from a UDMF WAD.
+
+    The MyWayHome scenarios use Doom thing type 2018 for the collectable vest
+    that terminates the sparse task.
+    """
+    text = _read_wad_textmap(wad_path, doom_map)
+    positions = []
+    for thing in _parse_udmf_blocks(text, "thing"):
+        if thing.get("type") == 2018 and "x" in thing and "y" in thing:
+            positions.append((float(thing["x"]), float(thing["y"])))
+    return positions
+
+
 def _map_extent(map_lines, xs=None, ys=None, pad_frac=0.04):
     x_vals, y_vals = [], []
     if map_lines:
@@ -996,7 +1010,20 @@ def _map_canvas_transform(extent, width, height):
     return to_px, (int(round(x0)), int(round(y0)), int(round(used_w)), int(round(used_h)))
 
 
-def save_map_video(path, map_lines, xs, ys, in_tv=None, fps=30, width=960, height=720):
+def _draw_vest_markers(frame, vest_positions, to_px):
+    import cv2
+
+    for vx, vy in vest_positions or []:
+        cx, cy = to_px(vx, vy)
+        size = 12
+        color = (40, 40, 230)
+        cv2.line(frame, (cx - size, cy - size), (cx + size, cy + size), color, 3, lineType=cv2.LINE_AA)
+        cv2.line(frame, (cx - size, cy + size), (cx + size, cy - size), color, 3, lineType=cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), size + 5, color, 1, lineType=cv2.LINE_AA)
+        cv2.putText(frame, "vest", (cx + 14, cy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, lineType=cv2.LINE_AA)
+
+
+def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, fps=30, width=960, height=720):
     """Render a top-down trajectory video on the fixed WAD map.
 
     The transform intentionally matches the static heatmap convention: Doom x grows
@@ -1035,6 +1062,7 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, fps=30, width=960, heigh
                 if bool(is_blocking) != blocking:
                     continue
                 cv2.line(base, to_px(x1, y1), to_px(x2, y2), color, thickness, lineType=cv2.LINE_AA)
+        _draw_vest_markers(base, vest_positions, to_px)
 
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
         if not writer.isOpened():
@@ -1049,6 +1077,7 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, fps=30, width=960, heigh
                 overlay = frame.copy()
                 cv2.polylines(overlay, [trail], False, (210, 105, 30), 3, lineType=cv2.LINE_AA)
                 frame = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
+            _draw_vest_markers(frame, vest_positions, to_px)
             color = (0, 150, 255) if in_tv[i] else (40, 70, 230)
             cv2.circle(frame, pt, 8, color, -1, lineType=cv2.LINE_AA)
             cv2.circle(frame, pt, 9, (20, 20, 20), 1, lineType=cv2.LINE_AA)
@@ -1073,7 +1102,7 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, fps=30, width=960, heigh
 
 
 @torch.no_grad()
-def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None):
+def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None, vest_positions=None):
     """Roll out the current policy in a fresh single env and write an mp4 via OpenCV.
 
     Uses cv2.VideoWriter (cv2 is already a hard dependency) instead of imageio to
@@ -1124,7 +1153,7 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
                 obs_writer.write(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR))
             obs_writer.release()
         if map_path is not None and map_lines:
-            save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, fps=30)
+            save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, vest_positions=vest_positions, fps=30)
         return path
     except Exception as exc:  # pragma: no cover
         print(f"[viz] video skipped: {exc}")
@@ -1326,11 +1355,16 @@ if __name__ == "__main__":
         os.makedirs(video_dir, exist_ok=True)
         os.makedirs(map_video_dir, exist_ok=True)
     viz_map_lines = []
+    viz_vest_positions = []
     if args.heatmap_every or args.capture_video:
         wad_path = os.path.join(args.wad_dir, SCENARIO_WADS[args.scenario])
         try:
             viz_map_lines = load_wad_map_lines(wad_path, args.doom_map)
+            viz_vest_positions = load_wad_vest_positions(wad_path, args.doom_map)
             print(f"[viz] loaded {len(viz_map_lines)} WAD map lines for heatmap/map-video overlays")
+            if viz_vest_positions:
+                pretty = ", ".join(f"({x:.0f},{y:.0f})" for x, y in viz_vest_positions)
+                print(f"[viz] vest marker(s): {pretty}")
         except Exception as exc:
             print(f"[viz] maze overlay unavailable: {exc}")
 
@@ -1360,12 +1394,16 @@ if __name__ == "__main__":
     if world_model_prev is not None:
         world_model_prev.load_state_dict(world_model.state_dict())
 
-    combined_parameters = list(world_model.parameters())  # WM is always trained
+    wm_parameters = list(world_model.parameters())  # WM is always trained
+    policy_aux_parameters = []
     if not is_random:
-        combined_parameters += list(agent.parameters())  # random has no learned policy
+        policy_aux_parameters += list(agent.parameters())  # random has no learned policy
     if uses_rnd:
-        combined_parameters += list(rnd_model.predictor.parameters())
-    optimizer = optim.Adam(combined_parameters, lr=args.learning_rate, eps=1e-5)
+        policy_aux_parameters += list(rnd_model.predictor.parameters())
+    wm_optimizer = optim.Adam(wm_parameters, lr=args.learning_rate, eps=1e-5)
+    policy_optimizer = (
+        optim.Adam(policy_aux_parameters, lr=args.learning_rate, eps=1e-5) if policy_aux_parameters else None
+    )
     critic_optimizer = (
         optim.Adam(neural_critic.parameters(), lr=args.learning_rate, eps=1e-5) if uses_critic else None
     )
@@ -1393,22 +1431,22 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    # Initialize observation normalization with random data (WM/RND methods only).
-    if use_intrinsic:
-        print("Initializing observation normalization...")
-        next_ob = []
-        for _ in range(args.num_steps * args.num_iterations_obs_norm_init):
-            acs = np.random.randint(0, num_actions, size=(args.num_envs,))
-            s, _, _, _, _ = envs.step(acs)
-            s = np.asarray(s)
-            next_ob += s[:, 3, :, :].reshape([-1, 1, 84, 84]).tolist()
-            if len(next_ob) % (args.num_steps * args.num_envs) == 0:
-                obs_rms.update(np.stack(next_ob))
-                next_ob = []
-        print("Done.")
-        # resync next_obs with the env state after the warmup steps
-        next_obs, _ = envs.reset()
-        next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
+    # Initialize observation normalization for every method. RND uses it for reward, and the passive
+    # WM-eval model uses it for all methods, so the normalization protocol should be identical.
+    print("Initializing observation normalization...")
+    next_ob = []
+    for _ in range(args.num_steps * args.num_iterations_obs_norm_init):
+        acs = np.random.randint(0, num_actions, size=(args.num_envs,))
+        s, _, _, _, _ = envs.step(acs)
+        s = np.asarray(s)
+        next_ob += s[:, 3, :, :].reshape([-1, 1, 84, 84]).tolist()
+        if len(next_ob) % (args.num_steps * args.num_envs) == 0:
+            obs_rms.update(np.stack(next_ob))
+            next_ob = []
+    print("Done.")
+    # resync next_obs with the env state after the warmup steps
+    next_obs, _ = envs.reset()
+    next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
 
     # Held-out deterministic transitions for the WM-accuracy eval (cached per seed; identical across methods).
     print("Preparing held-out WM-eval set...")
@@ -1471,9 +1509,8 @@ if __name__ == "__main__":
     for update in range(1, args.num_iterations + 1):
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / args.num_iterations
-            optimizer.param_groups[0]["lr"] = frac * args.learning_rate
-            if critic_optimizer is not None:
-                critic_optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+            if policy_optimizer is not None:
+                policy_optimizer.param_groups[0]["lr"] = frac * args.learning_rate
 
         rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
@@ -1701,11 +1738,16 @@ if __name__ == "__main__":
                     entropy_loss = entropy.mean()
                     loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + wm_loss + rnd_loss
 
-                optimizer.zero_grad()
+                wm_optimizer.zero_grad()
+                if policy_optimizer is not None:
+                    policy_optimizer.zero_grad()
                 loss.backward()
                 if args.max_grad_norm:
-                    nn.utils.clip_grad_norm_(combined_parameters, args.max_grad_norm)
-                optimizer.step()
+                    if policy_aux_parameters:
+                        nn.utils.clip_grad_norm_(policy_aux_parameters, args.max_grad_norm)
+                if policy_optimizer is not None:
+                    policy_optimizer.step()
+                wm_optimizer.step()
 
                 # neural critic (aux) regresses the post-WM-update error on the same samples
                 if uses_critic:
@@ -1717,8 +1759,6 @@ if __name__ == "__main__":
                         critic_loss = (F.mse_loss(critic_pred_train, err_after, reduction="none") * mask).sum() / denom
                         critic_optimizer.zero_grad()
                         critic_loss.backward()
-                        if args.max_grad_norm:
-                            nn.utils.clip_grad_norm_(neural_critic.parameters(), args.max_grad_norm)
                         critic_optimizer.step()
                     critic_loss_sum += critic_loss.item()
                     err_after_sum += err_after.mean().item()
@@ -1853,6 +1893,7 @@ if __name__ == "__main__":
                 args.seed,
                 map_path=map_video_path,
                 map_lines=viz_map_lines,
+                vest_positions=viz_vest_positions,
             )
             if p and args.track:
                 wandb.log({"global_step": global_step, "viz/video": wandb.Video(p)})

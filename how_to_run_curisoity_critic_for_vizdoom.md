@@ -87,20 +87,21 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py \
     --method cc --scenario sparse --noisy-tv \
     --total-timesteps 200000 --num-envs 8 \
     --capture-video --video-every 1 --wm-panel-every 5 --heatmap-every 5 \
-    --seed 1
+    --save-model --ckpt-every 50 --seed 1
 ```
 
 Check the console and `runs/<run_name>/`:
 
-- **`SPS:` printed** and steady. Multiply by 86,400 to estimate agent steps/day; a 30M-step
-  run should fit in well under a day. If SPS is low, raise `--num-envs` toward your
-  CPU core count.
+- **`SPS:` printed** and steady. This visual smoke test records videos every update, so SPS will
+  be much lower than full-run training throughput; use it mainly to catch hangs and artifact bugs.
 - **`runs/<run_name>/viz/wm_panel_*.png`** shows input / WM prediction / true next / abs error.
 - **`runs/<run_name>/viz/heatmap_*.png`** shows visitation and mean intrinsic reward overlaid on
   the top-down maze map, with the printed `TV-zone time fraction`.
 - **`runs/<run_name>/videos/*.mp4`** plays the agent in the maze.
 - **`runs/<run_name>/map_vids/*.mp4`** shows the same rollout as a top-down moving dot/trail on
-  the fixed 2D maze map.
+  the fixed 2D maze map, with the fixed vest/goal position marked by a red cross.
+- **`runs/<run_name>/checkpoints/ckpt_update000050.cleanrl_model`** exists, and the final
+  `ppo_curiosity_critic_vizdoom.cleanrl_model` is written when the run exits.
 - **`runs/<run_name>/plots/*.png`** is generated automatically at normal completion from that
   run's own `metrics.jsonl`, for quick single-run inspection.
 
@@ -111,6 +112,10 @@ python cleanrl/plot_vizdoom_curiosity.py --runs-dir runs --out paper_figures/viz
 ```
 
 Confirm it writes plot PNGs plus `paper_figures/vizdoom_smoke/summary_final_metrics.csv`.
+
+For a cleaner throughput estimate after the visual smoke passes, run a short no-viz probe with
+`--video-every 0 --wm-panel-every 0 --heatmap-every 0`. Then `SPS × 86,400` is the rough
+agent-steps/day estimate. If that SPS is low, raise `--num-envs` toward your CPU core count.
 
 Map-name check: if VizDoom errors on the map, list it with
 `python -c "import vizdoom,os; g=vizdoom.DoomGame(); g.set_doom_scenario_path('vizdoom_scenarios/my_way_home_sparse.wad'); print('ok')"`
@@ -354,7 +359,7 @@ Every run writes to `runs/<run_name>/`:
   `viz/positions_*.npz` (raw x/y/intrinsic/TV-zone so heatmaps/coverage can be re-rendered later).
 - `videos/update*.mp4` (RGB) **and** `update*_obs.mp4` (the agent's exact grayscale observation, noise included).
 - `map_vids/update*.mp4` — top-down WAD-map trajectory videos generated from the same rollout as
-  `videos/update*.mp4`.
+  `videos/update*.mp4`, with the fixed vest/goal position marked by a red cross.
 - `plots/*.png` + `plots/summary_final_metrics.csv` — automatic per-run plots written at normal
   training exit. Disable with `--no-post-plot`; set `--post-plot-dir` to redirect them.
 

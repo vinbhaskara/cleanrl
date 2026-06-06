@@ -100,13 +100,18 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py --preflight --method rnd --scenar
 python cleanrl/ppo_curiosity_critic_vizdoom.py \
     --method cc --scenario sparse --noisy-tv \
     --total-timesteps 200000 --num-envs 8 \
-    --capture-video --video-every 1 --wm-panel-every 5 --heatmap-every 5 --seed 1
+    --capture-video --video-every 1 --wm-panel-every 5 --heatmap-every 5 \
+    --save-model --ckpt-every 50 --seed 1
 ```
 
 Confirm in `runs/<run_name>/`:
-- a healthy, steady `SPS:` (× 86,400 ≈ agent steps/day; a 30M run should fit under a day),
+- a healthy, steady `SPS:`. This visual smoke test uses `--video-every 1`, so SPS will be
+  much lower than full-run training throughput; use it mainly to catch hangs and artifact bugs.
 - `viz/wm_panel_*.png`, maze-overlaid `viz/heatmap_*.png`, `videos/*.mp4`, and
-  `map_vids/*.mp4` are produced and look sane.
+  `map_vids/*.mp4` are produced and look sane. The top-down `map_vids/` video should show
+  a red `vest` cross in the fixed goal room.
+- `checkpoints/ckpt_update000050.cleanrl_model` exists, plus the final
+  `ppo_curiosity_critic_vizdoom.cleanrl_model` when the smoke run exits.
 - if `--track` is on, W&B charts should use `global_step` as the x-axis. That is total
   vectorized env interactions (`num_envs × env steps`), so a 30M run should span roughly
   0 → 30,000,000 rather than update/logging count.
@@ -121,7 +126,10 @@ python cleanrl/plot_vizdoom_curiosity.py --runs-dir runs --out paper_figures/viz
 
 Confirm it writes PNG plots plus `paper_figures/vizdoom_smoke/summary_final_metrics.csv`.
 
-If SPS is low, raise `--num-envs` toward your CPU core count and re-check.
+If you want a cleaner throughput estimate after the visual smoke passes, run a short no-viz probe
+with `--video-every 0 --wm-panel-every 0 --heatmap-every 0`; then `SPS × 86,400` is the rough
+agent-steps/day estimate. If that SPS is low, raise `--num-envs` toward your CPU core count and
+re-check.
 
 **Gate: do not launch the full matrix until the smoke test looks right.**
 
