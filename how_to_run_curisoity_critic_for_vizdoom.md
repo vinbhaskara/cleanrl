@@ -26,6 +26,16 @@ Two conditions, selected with `--noisy-tv`:
   sparse via `--probe-maze` (maze max reach ~516): a localized start-region zone the
   agent starts inside but can leave, keeping the far rooms / goal noise-free.
 
+**World-model architecture & optimization (known-good defaults — keep these to reproduce the strong runs):**
+- `--wm-arch downsample` (default): the original fast stride-4 CNN world model + critic that produced
+  the strong early results (CC return ≈ 1.0 by ~50k). `--wm-arch unet` is a slower full-resolution
+  U-Net that predicts sharper next frames — useful mainly to lower `eval/wm_holdout_l2` for the
+  WM-quality figure; A/B it only after the downsample baseline is stable.
+- The world model, policy, and critic each have their own Adam optimizer, and **all three are
+  LR-annealed and gradient-clipped at `--max-grad-norm` (0.5)**. Keep these on — dropping the WM/critic
+  annealing or clipping is what previously destabilized the extrinsic return.
+- `--num-envs` defaults to **32** (the batch size of the known-good runs).
+
 ---
 
 ## 1. One-Time Setup
@@ -379,8 +389,8 @@ New metrics (logged for **all** methods):
 - **`charts/*_periodic`** — episodic return/length logged every update (dense, regular), so methods that rarely finish episodes still span the full x-axis (fixes the wandb "short line" look). The original per-episode `charts/*` are untouched.
 
 **Disk note:** periodic full checkpoints are ~25–30 MB each; at the default `--ckpt-every 500`
-with `--num-envs 24`, a 30M run has 9,765 updates and writes 20 periodic checkpoints
-(including the final-update trigger), roughly 500–600 MB per run. Raise `--ckpt-every`
+with `--num-envs 32`, a 30M run has ~7,324 updates and writes ~15 periodic checkpoints
+(including the final-update trigger), roughly 400–450 MB per run. Raise `--ckpt-every`
 further or set it to 0 if disk-constrained.
 
 ## 5c. Generate Paper Figures
@@ -437,7 +447,9 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py --method cc --scenario very_spars
 
 Notes:
 
-- `--num-envs` defaults to 24, matching the 24-core i9 workstation. If you move machines,
-  set it near the CPU core count and compare settled SPS.
+- `--num-envs` defaults to **32** (the batch size of the known-good runs). That's above the
+  workstation's 24 threads, so the env workers oversubscribe the CPU slightly — but it reproduces
+  the run that worked. Lowering it (e.g., to 24) frees CPU yet changes the PPO batch size, so
+  re-verify results if you do.
 - ICM and Disagreement are de-scoped for the TMLR version; this script intentionally
   focuses on RND, PPO/random floors, and the V1/V2 ablations.

@@ -136,6 +136,13 @@ re-check.
 ## Step 4 — Full runs (Phases 1–5)
 
 Follow `how_to_run_curisoity_critic_for_vizdoom.md` §3, in `tmux`:
+
+**Training defaults (keep these — they reproduce the known-good regime):** `--wm-arch downsample`
+(the fast original CNN world model; `unet` is the slower, sharper-WM A/B option), `--num-envs 32`,
+and WM / policy / critic each on their own Adam, **all LR-annealed and grad-clipped at
+`--max-grad-norm 0.5`**. Dropping the WM/critic annealing or clipping is what previously destabilized
+the extrinsic return.
+
 - **Phase 1 (headline):** noisy-TV — `cc`, `rnd`, `c_v2` (3 seeds). `c_v2` is promoted here (closest competitor → early signal on whether the learned baseline is the real win).
 - **Phase 2:** plain MyWayHome — full method set.
 - **Phase 3:** finish noisy-TV baselines (`c_v1`, `ppo`, `random`).
@@ -182,7 +189,7 @@ All also appear in W&B under `viz/` when `--track` is on.
 `time/*` compute breakdowns, `charts/*_periodic` dense return plots, `viz/positions_*.npz`
 raw heatmap data, RGB + exact-observation videos, and top-down `map_vids/` trajectory
 videos, plus automatic per-run `plots/`. See how-to §5b. Disk: periodic checkpoints are roughly
-500–600 MB / 30M run at the default `--ckpt-every 500` with `--num-envs 24`; raise
+400–450 MB / 30M run at the default `--ckpt-every 500` with `--num-envs 32`; raise
 `--ckpt-every` further if tight.
 
 **Note — training-time `videos/*.mp4` do NOT show the noise patch.** The noise is

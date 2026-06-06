@@ -85,8 +85,10 @@ class Args:
     """total timesteps of the experiments (paper default: 30M)"""
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 24
+    num_envs: int = 32
     """the number of parallel VizDoom processes (AsyncVectorEnv workers)"""
+    wm_arch: str = "downsample"
+    """world-model / critic architecture: 'downsample' (original fast CNN, known-good) or 'unet' (full-res, slower)"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
@@ -533,6 +535,104 @@ class CuriosityCriticCNN(nn.Module):
         h = self.bottleneck(self.pool1(h))
         pooled = torch.cat([self.avg_pool(h).flatten(1), self.max_pool(h).flatten(1)], dim=1)
         return self.head(pooled)
+
+
+class ForwardCNNDownsample(nn.Module):
+    """Original fast downsampling-CNN World Model (predicts the next grayscale frame).
+
+    This is the architecture from the known-good baseline (stride-4/2/1 encoder, transpose-conv
+    decoder). Much cheaper than the full-resolution U-Net; selected via --wm-arch downsample."""
+
+    def __init__(self, num_actions, frame_stack=4, channels=(64, 128, 256)):
+        super().__init__()
+        c1, c2, c3 = channels
+        self.num_actions = num_actions
+        self.down1 = nn.Sequential(
+            layer_init(nn.Conv2d(frame_stack + num_actions, c1, kernel_size=8, stride=4)),
+            nn.LeakyReLU(),
+        )
+        self.down2 = nn.Sequential(
+            layer_init(nn.Conv2d(c1, c2, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+        )
+        self.bottleneck = nn.Sequential(
+            layer_init(nn.Conv2d(c2, c3, kernel_size=3, stride=1)),
+            nn.LeakyReLU(),
+        )
+        self.up2 = nn.Sequential(
+            layer_init(nn.ConvTranspose2d(c3, c2, kernel_size=3, stride=1)),
+            nn.LeakyReLU(),
+        )
+        self.fuse2 = nn.Sequential(
+            layer_init(nn.Conv2d(c2 * 2, c2, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+        )
+        self.up1 = nn.Sequential(
+            layer_init(nn.ConvTranspose2d(c2, c1, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+        )
+        self.fuse1 = nn.Sequential(
+            layer_init(nn.Conv2d(c1 * 2, c1, kernel_size=3, stride=1, padding=1)),
+            nn.LeakyReLU(),
+        )
+        self.out = nn.Sequential(
+            layer_init(nn.ConvTranspose2d(c1, 1, kernel_size=8, stride=4)),
+        )
+
+    def forward(self, obs_stack, action_onehot):
+        _, _, height, width = obs_stack.shape
+        action_map = _action_planes(action_onehot, height, width)
+        h = torch.cat([obs_stack, action_map], dim=1)
+        skip1 = self.down1(h)
+        skip2 = self.down2(skip1)
+        bottleneck = self.bottleneck(skip2)
+        up2 = self.up2(bottleneck)
+        up2 = self.fuse2(torch.cat([up2, skip2], dim=1))
+        up1 = self.up1(up2)
+        up1 = self.fuse1(torch.cat([up1, skip1], dim=1))
+        return self.out(up1)
+
+
+class CuriosityCriticCNNDownsample(nn.Module):
+    """Original fast downsampling-CNN Neural Critic predicting the scalar post-update WM error."""
+
+    def __init__(self, num_actions, frame_stack=4):
+        super().__init__()
+        feature_output = 7 * 7 * 64
+        self.encoder = nn.Sequential(
+            layer_init(nn.Conv2d(frame_stack + num_actions, 32, kernel_size=8, stride=4)),
+            nn.LeakyReLU(),
+            layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
+            nn.LeakyReLU(),
+            layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
+            nn.LeakyReLU(),
+            nn.Flatten(),
+            layer_init(nn.Linear(feature_output, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.ReLU(),
+            layer_init(nn.Linear(512, 1)),
+        )
+
+    def forward(self, obs_stack, action_onehot):
+        _, _, height, width = obs_stack.shape
+        action_map = _action_planes(action_onehot, height, width)
+        h = torch.cat([obs_stack, action_map], dim=1)
+        return self.encoder(h)
+
+
+def build_world_model(args, num_actions):
+    """Select the world-model architecture: 'downsample' (original fast CNN, default) or 'unet' (full-res)."""
+    if args.wm_arch == "unet":
+        return ForwardCNN(num_actions=num_actions)
+    return ForwardCNNDownsample(num_actions=num_actions)
+
+
+def build_critic(args, num_actions):
+    """Select the critic architecture to match the world model."""
+    if args.wm_arch == "unet":
+        return CuriosityCriticCNN(num_actions=num_actions)
+    return CuriosityCriticCNNDownsample(num_actions=num_actions)
 
 
 class RNDModel(nn.Module):
@@ -1400,9 +1500,9 @@ if __name__ == "__main__":
     # A world model is trained for EVERY method (identical architecture + training) so WM accuracy is
     # comparable across methods. For cc/c_v1/c_v2 it also produces the intrinsic reward; for
     # rnd/ppo/random it is a passive evaluation WM (trained on collected data, never feeds the reward).
-    world_model = ForwardCNN(num_actions=num_actions).to(device)
-    world_model_prev = ForwardCNN(num_actions=num_actions).to(device) if args.method == "c_v2" else None
-    neural_critic = CuriosityCriticCNN(num_actions=num_actions).to(device) if uses_critic else None
+    world_model = build_world_model(args, num_actions).to(device)
+    world_model_prev = build_world_model(args, num_actions).to(device) if args.method == "c_v2" else None
+    neural_critic = build_critic(args, num_actions).to(device) if uses_critic else None
     rnd_model = RNDModel().to(device) if uses_rnd else None
     if world_model_prev is not None:
         world_model_prev.load_state_dict(world_model.state_dict())
@@ -1524,8 +1624,12 @@ if __name__ == "__main__":
         is_final_update = update == args.num_iterations
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / args.num_iterations
+            lrnow = frac * args.learning_rate
+            wm_optimizer.param_groups[0]["lr"] = lrnow
             if policy_optimizer is not None:
-                policy_optimizer.param_groups[0]["lr"] = frac * args.learning_rate
+                policy_optimizer.param_groups[0]["lr"] = lrnow
+            if critic_optimizer is not None:
+                critic_optimizer.param_groups[0]["lr"] = lrnow
 
         rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
@@ -1765,6 +1869,7 @@ if __name__ == "__main__":
                     policy_optimizer.zero_grad()
                 loss.backward()
                 if args.max_grad_norm:
+                    nn.utils.clip_grad_norm_(wm_parameters, args.max_grad_norm)
                     if policy_aux_parameters:
                         nn.utils.clip_grad_norm_(policy_aux_parameters, args.max_grad_norm)
                 if policy_optimizer is not None:
@@ -1781,6 +1886,8 @@ if __name__ == "__main__":
                         critic_loss = F.mse_loss(critic_pred_train, err_after, reduction="none").mean()
                         critic_optimizer.zero_grad()
                         critic_loss.backward()
+                        if args.max_grad_norm:
+                            nn.utils.clip_grad_norm_(neural_critic.parameters(), args.max_grad_norm)
                         critic_optimizer.step()
                     critic_loss_sum += critic_loss.item()
                     err_after_sum += err_after.mean().item()
