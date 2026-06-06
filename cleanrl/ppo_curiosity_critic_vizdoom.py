@@ -460,12 +460,13 @@ class UNetBlock(nn.Module):
 class ForwardCNN(nn.Module):
     """Action-conditioned small U-Net World Model (predicts the next grayscale frame).
 
-    The full-resolution encoder skip is learned from all four input frames plus
-    action planes. Using only the latest frame would throw away motion cues needed
-    to predict the next view after turns/moves.
+    The full-resolution skip carries only the latest frame. The full 4-frame
+    stack plus action planes still enter the encoder, so motion/action context is
+    available without letting older frames or action planes bypass the bottleneck
+    directly into the image decoder.
     """
 
-    def __init__(self, num_actions, frame_stack=4, channels=(48, 96, 192)):
+    def __init__(self, num_actions, frame_stack=4, channels=(32, 64, 128)):
         super().__init__()
         c1, c2, c3 = channels
         self.num_actions = num_actions
@@ -477,20 +478,21 @@ class ForwardCNN(nn.Module):
         self.up1 = layer_init(nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2))  # 21 -> 42
         self.dec1 = UNetBlock(c2 + c2, c2)
         self.up0 = layer_init(nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2))  # 42 -> 84
-        self.dec0 = UNetBlock(c1 + c1, c1)
+        self.dec0 = UNetBlock(c1 + 1, c1)
         self.out = layer_init(nn.Conv2d(c1, 1, kernel_size=1))
 
     def forward(self, obs_stack, action_onehot):
         _, _, height, width = obs_stack.shape
         action_map = _action_planes(action_onehot, height, width)
         h = torch.cat([obs_stack, action_map], dim=1)
-        skip0 = self.enc0(h)
-        skip1 = self.enc1(self.pool0(skip0))
+        latest_frame = obs_stack[:, -1:, :, :]
+        context0 = self.enc0(h)
+        skip1 = self.enc1(self.pool0(context0))
         bottleneck = self.bottleneck(self.pool1(skip1))
         up1 = self.up1(bottleneck)
         dec1 = self.dec1(torch.cat([up1, skip1], dim=1))
         up0 = self.up0(dec1)
-        dec0 = self.dec0(torch.cat([up0, skip0], dim=1))
+        dec0 = self.dec0(torch.cat([up0, latest_frame], dim=1))
         return self.out(dec0)
 
 
@@ -502,7 +504,7 @@ class CuriosityCriticCNN(nn.Module):
     need the U-Net decoder because the target is one scalar error, not an image.
     """
 
-    def __init__(self, num_actions, frame_stack=4, channels=(48, 96, 192)):
+    def __init__(self, num_actions, frame_stack=4, channels=(32, 64, 128)):
         super().__init__()
         c1, c2, c3 = channels
         self.enc0 = UNetBlock(frame_stack + num_actions, c1)  # 84x84
