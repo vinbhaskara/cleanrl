@@ -65,8 +65,8 @@ Build the fixed held-out transition sets used to score every method's world-mode
 (`eval/wm_holdout_l2`) — one set per seed, shared by all methods of that seed:
 
 ```bash
-python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 2048
-python cleanrl/build_holdout.py --scenario very_sparse --seeds 1 2 3 --size 2048
+python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 10000
+python cleanrl/build_holdout.py --scenario very_sparse --seeds 1 2 3 --size 10000
 ```
 
 This writes `vizdoom_holdout/holdout_{sparse,very_sparse}_seed{1,2,3}.npz` plus a **coverage

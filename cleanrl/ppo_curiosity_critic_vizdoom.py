@@ -178,7 +178,7 @@ class Args:
     """held-out world-model accuracy eval cadence (updates)"""
     ckpt_every: int = 200
     """periodic full-model checkpoint cadence (updates); 0 disables"""
-    holdout_size: int = 1024
+    holdout_size: int = 10000
     """number of held-out deterministic transitions for the WM-accuracy eval (cached per seed)"""
     holdout_dir: str = "./vizdoom_holdout"
     """directory for the cached per-seed held-out transition sets"""

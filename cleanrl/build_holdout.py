@@ -10,7 +10,7 @@
 # corridors before trusting the metric.
 #
 # Usage (from repo root):
-#   python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 2048
+#   python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 10000
 #
 # Outputs (default ./vizdoom_holdout/):
 #   holdout_<scenario>_seed<k>.npz            (obs, act, next_frame, x, y)
@@ -194,7 +194,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default="sparse", choices=["sparse", "very_sparse", "dense"])
     ap.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
-    ap.add_argument("--size", type=int, default=2048, help="transitions per held-out set")
+    ap.add_argument("--size", type=int, default=10000, help="transitions per held-out set")
     ap.add_argument("--p-forward", type=float, default=0.55, help="probability of MOVE_FORWARD in the walk")
     ap.add_argument("--out", default="./vizdoom_holdout")
     ap.add_argument("--wad-dir", default="./vizdoom_scenarios")

@@ -68,8 +68,8 @@ ls vizdoom_scenarios/   # expect the 3 my_way_home_*.wad files (bundled in the r
 ## Step 1.5 — Build the held-out WM-eval sets (run once)
 
 ```bash
-python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 2048
-python cleanrl/build_holdout.py --scenario very_sparse --seeds 1 2 3 --size 2048
+python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 10000
+python cleanrl/build_holdout.py --scenario very_sparse --seeds 1 2 3 --size 10000
 ```
 
 Writes `vizdoom_holdout/holdout_{sparse,very_sparse}_seed{1,2,3}.npz` + a **coverage heatmap
