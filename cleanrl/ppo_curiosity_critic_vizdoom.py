@@ -1796,10 +1796,14 @@ if __name__ == "__main__":
         intr_arr = np.asarray(ep_intr, dtype=np.float32)
         tv_count = int(tv_arr.sum()) if tv_arr.size else 0
         non_tv_count = int((~tv_arr).sum()) if tv_arr.size else 0
+        policy_lr = policy_optimizer.param_groups[0]["lr"] if policy_optimizer is not None else wm_optimizer.param_groups[0]["lr"]
+        critic_lr = critic_optimizer.param_groups[0]["lr"] if critic_optimizer is not None else 0.0
         row = {
             "global_step": global_step,
             "update": update,
-            "charts/learning_rate": optimizer.param_groups[0]["lr"],
+            "charts/learning_rate": policy_lr,
+            "charts/wm_learning_rate": wm_optimizer.param_groups[0]["lr"],
+            "charts/critic_learning_rate": critic_lr,
             "charts/SPS": sps,
             "charts/goal_hits_update": goal_hits_update,
             "charts/episodes_update": episode_ends_update,
