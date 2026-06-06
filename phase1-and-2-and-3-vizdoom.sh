@@ -1,4 +1,4 @@
-PROJECT=curiosity-critic-vizdoom-JUN2026-Final
+PROJECT=curiosity-critic-vizdoom-JUN2026-Final2
 
 # Headline noisy-TV (full static, alpha=1 default): CC, RND, C_V2 -- seeds 1-3
 for SEED in 1 2 3; do
@@ -11,7 +11,7 @@ for SEED in 1 2 3; do
   done
 done
 
-PROJECT=curiosity-critic-vizdoom-JUN2026-Final
+PROJECT=curiosity-critic-vizdoom-JUN2026-Final2
 
 for SEED in 1 2 3; do
   for METHOD in c_v1 ppo random; do
@@ -23,7 +23,7 @@ for SEED in 1 2 3; do
   done
 done
 
-PROJECT=curiosity-critic-vizdoom-JUN2026-Final
+PROJECT=curiosity-critic-vizdoom-JUN2026-Final2
 
 for SEED in 1 2 3; do
   for METHOD in cc rnd; do
@@ -44,5 +44,4 @@ for SEED in 1 2 3; do
       --track --wandb-project-name $PROJECT
   done
 done
-
 
