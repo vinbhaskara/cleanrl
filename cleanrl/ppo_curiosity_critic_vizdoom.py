@@ -918,7 +918,8 @@ def save_wm_panel(path, obs_last, pred_next, true_next, critic_value=None):
         cols = [("input frame", obs_last), ("WM prediction", pred_next), ("true next", true_next), ("abs error", err)]
         fig, axes = plt.subplots(1, len(cols), figsize=(3 * len(cols), 3.2))
         for ax, (title, img) in zip(axes, cols):
-            ax.imshow(img, cmap="gray")
+            title = f"{title}\nmin={np.nanmin(img):.1f} max={np.nanmax(img):.1f}"
+            ax.imshow(np.clip(img, 0, 255), cmap="gray", vmin=0, vmax=255)
             ax.set_title(title, fontsize=9)
             ax.axis("off")
         if critic_value is not None:
@@ -1117,7 +1118,6 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
         rgb_frames, obs_frames, xs, ys, in_tv = [], [], [], [], []
         for _ in range(args.video_steps):
             obs_arr = np.asarray(obs)
-            obs_frames.append(obs_arr[-1].copy())  # newest grayscale frame = exactly what the policy sees (real noise)
             if args.method == "random":
                 action_i = int(rng.integers(0, int(env.action_space.n)))
             else:
@@ -1125,6 +1125,7 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
                 action, _, _, _, _ = agent.get_action_and_value(obs_t)
                 action_i = int(action.item())
             obs, _, term, trunc, info = env.step(action_i)
+            obs_frames.append(np.asarray(obs)[-1].copy())  # newest post-action grayscale frame; real noise included
             rgb_frames.append(np.asarray(info.get("rgb")))
             xs.append(float(info.get("position_x", np.nan)))
             ys.append(float(info.get("position_y", np.nan)))
@@ -1768,10 +1769,11 @@ if __name__ == "__main__":
                 if last_panel is None and args.wm_panel_every and update % args.wm_panel_every == 0:
                     with torch.no_grad():
                         cv = float(neural_critic(mb_obs_norm[:1], mb_actions_onehot[:1]).item()) if uses_critic else None
+                        pred_raw = (world_model(mb_obs_norm[:1], mb_actions_onehot[:1]) * update_obs_std + update_obs_mean)
                         last_panel = (
                             b_obs[mb_inds][0, 3].cpu().numpy(),
-                            world_model(mb_obs_norm[:1], mb_actions_onehot[:1])[0, 0].cpu().numpy(),
-                            mb_target[0, 0].cpu().numpy(),
+                            pred_raw[0, 0].clamp(0, 255).cpu().numpy(),
+                            b_next_frames[mb_inds][0].cpu().numpy(),
                             cv,
                         )
                 n_mb += 1
