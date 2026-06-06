@@ -1,11 +1,10 @@
 # PPO + Curiosity-Critic on VizDoom (MyWayHome), single-file cleanRL-style script.
 #
 # This is the VizDoom counterpart of `ppo_curiosity_critic_envpool.py`. The PPO /
-# GAE / clip / value / coefficient machinery and the World-Model (WM) and
-# Neural-Critic (NC) architectures are carried over unchanged from the Atari
-# scripts (`ppo_rnd_envpool.py`, `ppo_curiosity_critic_envpool.py`). Only the
-# environment layer changes: envpool Atari -> Farama-Foundation VizDoom served
-# through the Gymnasium API and vectorized with `gymnasium.vector.AsyncVectorEnv`.
+# GAE / clip / value / coefficient machinery is carried over from the Atari
+# scripts (`ppo_rnd_envpool.py`, `ppo_curiosity_critic_envpool.py`). The
+# environment layer changes from envpool Atari to Farama-Foundation VizDoom, and
+# the world model is a proper small U-Net suited for image-to-image prediction.
 #
 # A single `--method` flag selects one of the six paper baselines, all sharing
 # the same WM/critic/PPO code so any performance gap traces to the reward signal:
@@ -384,7 +383,7 @@ def make_env(args: "Args", idx: int, seed: int, expose_rgb: bool = False):
 
 
 # ----------------------------------------------------------------------------- #
-#  Networks (carried over unchanged from the Atari scripts)
+#  Networks
 # ----------------------------------------------------------------------------- #
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -442,85 +441,94 @@ def _action_planes(action_onehot, height, width):
     return action_onehot[:, :, None, None].expand(-1, -1, height, width)
 
 
-class ForwardCNN(nn.Module):
-    """Action-conditioned U-Net World Model (predicts the next grayscale frame)."""
+class UNetBlock(nn.Module):
+    """Classic U-Net conv block: two stride-1 3x3 convolutions at fixed resolution."""
 
-    def __init__(self, num_actions, frame_stack=4, channels=(64, 128, 256)):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.net = nn.Sequential(
+            layer_init(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)),
+            nn.ReLU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ForwardCNN(nn.Module):
+    """Action-conditioned small U-Net World Model (predicts the next grayscale frame).
+
+    The full-resolution encoder skip is learned from all four input frames plus
+    action planes. Using only the latest frame would throw away motion cues needed
+    to predict the next view after turns/moves.
+    """
+
+    def __init__(self, num_actions, frame_stack=4, channels=(48, 96, 192)):
         super().__init__()
         c1, c2, c3 = channels
         self.num_actions = num_actions
-        self.down1 = nn.Sequential(
-            layer_init(nn.Conv2d(frame_stack + num_actions, c1, kernel_size=8, stride=4)),
-            nn.LeakyReLU(),
-        )
-        self.down2 = nn.Sequential(
-            layer_init(nn.Conv2d(c1, c2, kernel_size=4, stride=2)),
-            nn.LeakyReLU(),
-        )
-        self.bottleneck = nn.Sequential(
-            layer_init(nn.Conv2d(c2, c3, kernel_size=3, stride=1)),
-            nn.LeakyReLU(),
-        )
-        self.up2 = nn.Sequential(
-            layer_init(nn.ConvTranspose2d(c3, c2, kernel_size=3, stride=1)),
-            nn.LeakyReLU(),
-        )
-        self.fuse2 = nn.Sequential(
-            layer_init(nn.Conv2d(c2 * 2, c2, kernel_size=3, stride=1, padding=1)),
-            nn.LeakyReLU(),
-        )
-        self.up1 = nn.Sequential(
-            layer_init(nn.ConvTranspose2d(c2, c1, kernel_size=4, stride=2)),
-            nn.LeakyReLU(),
-        )
-        self.fuse1 = nn.Sequential(
-            layer_init(nn.Conv2d(c1 * 2, c1, kernel_size=3, stride=1, padding=1)),
-            nn.LeakyReLU(),
-        )
-        self.out = nn.Sequential(
-            layer_init(nn.ConvTranspose2d(c1, 1, kernel_size=8, stride=4)),
-        )
+        self.enc0 = UNetBlock(frame_stack + num_actions, c1)  # 84x84
+        self.pool0 = nn.MaxPool2d(kernel_size=2, stride=2)  # 84 -> 42
+        self.enc1 = UNetBlock(c1, c2)  # 42x42
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 42 -> 21
+        self.bottleneck = UNetBlock(c2, c3)  # 21x21
+        self.up1 = layer_init(nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2))  # 21 -> 42
+        self.dec1 = UNetBlock(c2 + c2, c2)
+        self.up0 = layer_init(nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2))  # 42 -> 84
+        self.dec0 = UNetBlock(c1 + c1, c1)
+        self.out = layer_init(nn.Conv2d(c1, 1, kernel_size=1))
 
     def forward(self, obs_stack, action_onehot):
         _, _, height, width = obs_stack.shape
         action_map = _action_planes(action_onehot, height, width)
         h = torch.cat([obs_stack, action_map], dim=1)
-        skip1 = self.down1(h)
-        skip2 = self.down2(skip1)
-        bottleneck = self.bottleneck(skip2)
-        up2 = self.up2(bottleneck)
-        up2 = self.fuse2(torch.cat([up2, skip2], dim=1))
-        up1 = self.up1(up2)
-        up1 = self.fuse1(torch.cat([up1, skip1], dim=1))
-        return self.out(up1)
+        skip0 = self.enc0(h)
+        skip1 = self.enc1(self.pool0(skip0))
+        bottleneck = self.bottleneck(self.pool1(skip1))
+        up1 = self.up1(bottleneck)
+        dec1 = self.dec1(torch.cat([up1, skip1], dim=1))
+        up0 = self.up0(dec1)
+        dec0 = self.dec0(torch.cat([up0, skip0], dim=1))
+        return self.out(dec0)
 
 
 class CuriosityCriticCNN(nn.Module):
-    """Action-conditioned Neural Critic predicting the scalar post-update WM error."""
+    """Action-conditioned Neural Critic predicting the scalar post-update WM error.
 
-    def __init__(self, num_actions, frame_stack=4):
+    This mirrors the WM's encoder style after the U-Net upgrade: full-resolution
+    3x3 conv blocks with 2x2 pooling, then a scalar regression head. It does not
+    need the U-Net decoder because the target is one scalar error, not an image.
+    """
+
+    def __init__(self, num_actions, frame_stack=4, channels=(48, 96, 192)):
         super().__init__()
-        feature_output = 7 * 7 * 64
-        self.encoder = nn.Sequential(
-            layer_init(nn.Conv2d(frame_stack + num_actions, 32, kernel_size=8, stride=4)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(32, 64, kernel_size=4, stride=2)),
-            nn.LeakyReLU(),
-            layer_init(nn.Conv2d(64, 64, kernel_size=3, stride=1)),
-            nn.LeakyReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(feature_output, 512)),
+        c1, c2, c3 = channels
+        self.enc0 = UNetBlock(frame_stack + num_actions, c1)  # 84x84
+        self.pool0 = nn.MaxPool2d(kernel_size=2, stride=2)  # 84 -> 42
+        self.enc1 = UNetBlock(c1, c2)  # 42x42
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 42 -> 21
+        self.bottleneck = UNetBlock(c2, c3)  # 21x21
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.head = nn.Sequential(
+            layer_init(nn.Linear(c3 * 2, 256)),
             nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
+            layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
-            layer_init(nn.Linear(512, 1)),
+            layer_init(nn.Linear(256, 1)),
         )
 
     def forward(self, obs_stack, action_onehot):
         _, _, height, width = obs_stack.shape
         action_map = _action_planes(action_onehot, height, width)
         h = torch.cat([obs_stack, action_map], dim=1)
-        return self.encoder(h)
+        h = self.enc0(h)
+        h = self.enc1(self.pool0(h))
+        h = self.bottleneck(self.pool1(h))
+        pooled = torch.cat([self.avg_pool(h).flatten(1), self.max_pool(h).flatten(1)], dim=1)
+        return self.head(pooled)
 
 
 class RNDModel(nn.Module):
@@ -1677,28 +1685,32 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
                 mb_actions_long = b_actions.long()[mb_inds]
+                mb_obs_raw = b_obs[mb_inds]
+                mb_next_raw = b_next_frames[mb_inds]
 
-                mb_obs_norm = _normalize_stack(b_obs[mb_inds], update_obs_mean, update_obs_std)
-                mb_target = _normalize_stack(
-                    b_next_frames[mb_inds].reshape(-1, 1, 84, 84), update_obs_mean, update_obs_std
+                aux_mask = torch.rand(len(mb_inds), device=device) < args.update_proportion
+                if aux_mask.sum().item() == 0:
+                    aux_mask[torch.randint(0, len(mb_inds), (1,), device=device)] = True
+                aux_idx = aux_mask.nonzero(as_tuple=False).flatten()
+                aux_obs_norm = _normalize_stack(mb_obs_raw[aux_idx], update_obs_mean, update_obs_std)
+                aux_target = _normalize_stack(
+                    mb_next_raw[aux_idx].reshape(-1, 1, 84, 84), update_obs_mean, update_obs_std
                 )
-                mb_actions_onehot = F.one_hot(mb_actions_long, num_classes=num_actions).float()
-                mask = (torch.rand(len(mb_inds), device=device) < args.update_proportion).float()
-                denom = torch.max(mask.sum(), torch.tensor(1.0, device=device))
+                aux_actions_onehot = F.one_hot(mb_actions_long[aux_idx], num_classes=num_actions).float()
 
                 # world model -- trained for EVERY method (passive for rnd/ppo/random)
                 with _Timer(tt, "wm_update", args.profile_timing, device):
-                    wm_pred = world_model(mb_obs_norm, mb_actions_onehot)
-                    wm_loss = (_update_loss_per_sample(wm_pred, mb_target.detach()) * mask).sum() / denom
-                err_before_sum += _reward_error_per_sample(wm_pred.detach(), mb_target).mean().item()
+                    wm_pred = world_model(aux_obs_norm, aux_actions_onehot)
+                    wm_loss = _update_loss_per_sample(wm_pred, aux_target.detach()).mean()
+                err_before_sum += _reward_error_per_sample(wm_pred.detach(), aux_target).mean().item()
                 wm_loss_sum += wm_loss.item()
 
                 # RND predictor (aux) -- trained in the combined loss for rnd only
                 rnd_loss = torch.tensor(0.0, device=device)
                 if uses_rnd:
                     with _Timer(tt, "aux_update", args.profile_timing, device):
-                        pred_f, targ_f = rnd_model(mb_target)
-                        rnd_loss = (F.mse_loss(pred_f, targ_f.detach(), reduction="none").mean(-1) * mask).sum() / denom
+                        pred_f, targ_f = rnd_model(aux_target)
+                        rnd_loss = F.mse_loss(pred_f, targ_f.detach(), reduction="none").mean(-1).mean()
                     fwd_loss_log = rnd_loss.item()
                 else:
                     fwd_loss_log = wm_loss.item()
@@ -1707,7 +1719,7 @@ if __name__ == "__main__":
                     loss = wm_loss  # no learned policy; just train the passive world model
                 else:
                     _, newlogprob, entropy, new_ext_values, new_int_values = agent.get_action_and_value(
-                        b_obs[mb_inds], mb_actions_long
+                        mb_obs_raw, mb_actions_long
                     )
                     logratio = newlogprob - b_logprobs[mb_inds]
                     ratio = logratio.exp()
@@ -1754,10 +1766,10 @@ if __name__ == "__main__":
                 if uses_critic:
                     with _Timer(tt, "aux_update", args.profile_timing, device):
                         with torch.no_grad():
-                            post_pred = world_model(mb_obs_norm, mb_actions_onehot)
-                            err_after = _reward_error_per_sample(post_pred, mb_target).detach()
-                        critic_pred_train = neural_critic(mb_obs_norm, mb_actions_onehot).squeeze(-1)
-                        critic_loss = (F.mse_loss(critic_pred_train, err_after, reduction="none") * mask).sum() / denom
+                            post_pred = world_model(aux_obs_norm, aux_actions_onehot)
+                            err_after = _reward_error_per_sample(post_pred, aux_target).detach()
+                        critic_pred_train = neural_critic(aux_obs_norm, aux_actions_onehot).squeeze(-1)
+                        critic_loss = F.mse_loss(critic_pred_train, err_after, reduction="none").mean()
                         critic_optimizer.zero_grad()
                         critic_loss.backward()
                         critic_optimizer.step()
@@ -1768,12 +1780,12 @@ if __name__ == "__main__":
                 # stash one minibatch sample for the WM-prediction panel (every method trains a WM now)
                 if last_panel is None and args.wm_panel_every and update % args.wm_panel_every == 0:
                     with torch.no_grad():
-                        cv = float(neural_critic(mb_obs_norm[:1], mb_actions_onehot[:1]).item()) if uses_critic else None
-                        pred_raw = (world_model(mb_obs_norm[:1], mb_actions_onehot[:1]) * update_obs_std + update_obs_mean)
+                        cv = float(neural_critic(aux_obs_norm[:1], aux_actions_onehot[:1]).item()) if uses_critic else None
+                        pred_raw = (world_model(aux_obs_norm[:1], aux_actions_onehot[:1]) * update_obs_std + update_obs_mean)
                         last_panel = (
-                            b_obs[mb_inds][0, 3].cpu().numpy(),
+                            mb_obs_raw[aux_idx[0], 3].cpu().numpy(),
                             pred_raw[0, 0].clamp(0, 255).cpu().numpy(),
-                            b_next_frames[mb_inds][0].cpu().numpy(),
+                            mb_next_raw[aux_idx[0]].cpu().numpy(),
                             cv,
                         )
                 n_mb += 1
