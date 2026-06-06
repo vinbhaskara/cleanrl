@@ -135,6 +135,10 @@ Per `next-steps-for-paper-plan.md`:
   (`cc`/`rnd`/`c_v2`, plain + full noisy-TV only).
 - Seeds: **all methods/scenarios → seeds 1–3** (uniform; report IQM-style curves + bootstrap CIs). `c_v2` runs in the early wave alongside `cc`/`rnd`. Mini noise-α sweep (α=0.33, 0.66) for `cc`/`c_v2`/`rnd` only on sparse — see Phase 4; endpoints α=0 (plain, Phase 2) and α=1 (full noise, Phase 1) already covered.
 - `--total-timesteps 30000000` (30M) per run.
+- Default full-run cadence is speed-conscious: `--eval-every 200`, `--wm-panel-every 200`,
+  `--heatmap-every 200`, `--video-every 500`, `--ckpt-every 500`. Each cadence also fires
+  on the final training update before shutdown, even if the final update is not divisible by
+  the cadence.
 
 Use `tmux` so jobs survive disconnects:
 
@@ -371,10 +375,13 @@ New metrics (logged for **all** methods):
 - **`charts/goal_hits_update`**, **`charts/goal_reached_rate_update`**,
   **`charts/goal_reached_rate_100ep`** — vest/goal success signals. In sparse / very-sparse
   MyWayHome, positive reward is treated as vest collection.
-- **`time/*`** — per-update timing breakdown: `rollout_s`, `update_s`, `reward_aux_s` (aux model during reward), `wm_update_s`, `aux_update_s` (critic backprop for `cc`), `aux_total_s`, `eval_s`. `--profile-timing` (default on) uses cuda syncs for accurate GPU component timing.
+- **`time/*`** — per-update timing breakdown: `rollout_s`, `update_s`, `reward_aux_s` (aux model during reward), `wm_update_s`, `aux_update_s` (critic backprop for `cc`), `aux_total_s`, `eval_s`. Lightweight wall-clock timing is logged every update. Expensive cuda-synchronized profiling is **off by default**; use `--profile-timing` for every-update profiling only when diagnosing a bottleneck, or `--profile-last-updates N` for a short final profiling window.
 - **`charts/*_periodic`** — episodic return/length logged every update (dense, regular), so methods that rarely finish episodes still span the full x-axis (fixes the wandb "short line" look). The original per-episode `charts/*` are untouched.
 
-**Disk note:** periodic full checkpoints are ~25–30 MB each; at `--ckpt-every 200` that's ~1 GB per 30M run (~50 GB across the full matrix). Raise `--ckpt-every` (e.g. 500) or set it to 0 if disk-constrained.
+**Disk note:** periodic full checkpoints are ~25–30 MB each; at the default `--ckpt-every 500`
+with `--num-envs 24`, a 30M run has 9,765 updates and writes 20 periodic checkpoints
+(including the final-update trigger), roughly 500–600 MB per run. Raise `--ckpt-every`
+further or set it to 0 if disk-constrained.
 
 ## 5c. Generate Paper Figures
 
@@ -430,6 +437,7 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py --method cc --scenario very_spars
 
 Notes:
 
-- `--num-envs` defaults to 32; set it near your CPU core count for best throughput.
+- `--num-envs` defaults to 24, matching the 24-core i9 workstation. If you move machines,
+  set it near the CPU core count and compare settled SPS.
 - ICM and Disagreement are de-scoped for the TMLR version; this script intentionally
   focuses on RND, PPO/random floors, and the V1/V2 ablations.

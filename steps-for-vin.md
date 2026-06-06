@@ -12,7 +12,7 @@ Reasons:
   how-to) **plus** the `--preflight` self-test. There is nothing on master you
   need that isn't here.
 - Preflight is ~30 seconds and isolates the env-integration unknowns (map name,
-  screen format, reward, tv-radius, API drift, deps) **without** spinning up 32
+  screen format, reward, tv-radius, API drift, deps) **without** spinning up many
   processes or the training loop. If something is wrong, you get a clean, fast
   error instead of a confusing failure deep inside training.
 - The smoke test (minutes, full training loop + viz) is the *second* gate, run
@@ -143,8 +143,10 @@ Follow `how_to_run_curisoity_critic_for_vizdoom.md` §3, in `tmux`:
 - **Phase 5:** very-sparse stress matrix — `cc`, `rnd`, `c_v2` only, plain + full noisy-TV.
 
 Seeds: all methods/scenarios → 1–3 (uniform; report IQM-style curves + bootstrap CIs). All at
-`--total-timesteps 30000000`, with `--track --save-model --capture-video`. Sparse remains the
-primary TMLR matrix; very-sparse is the stress-test appendix/secondary result.
+`--total-timesteps 30000000`, with `--track --save-model --capture-video`. Speed-conscious defaults
+are `--eval-every 200`, `--wm-panel-every 200`, `--heatmap-every 200`, `--video-every 500`, and
+`--ckpt-every 500`. Each cadence also fires on the final training update before shutdown. Sparse
+remains the primary TMLR matrix; very-sparse is the stress-test appendix/secondary result.
 
 ## Step 5 — Generate paper figures (rerun after each phase)
 
@@ -179,8 +181,9 @@ All also appear in W&B under `viz/` when `--track` is on.
 (`eval/wm_holdout_l2`, comparable across all methods since every method trains a WM),
 `time/*` compute breakdowns, `charts/*_periodic` dense return plots, `viz/positions_*.npz`
 raw heatmap data, RGB + exact-observation videos, and top-down `map_vids/` trajectory
-videos, plus automatic per-run `plots/`. See how-to §5b. Disk: periodic checkpoints ≈ 1 GB / 30M run; raise `--ckpt-every`
-if tight.
+videos, plus automatic per-run `plots/`. See how-to §5b. Disk: periodic checkpoints are roughly
+500–600 MB / 30M run at the default `--ckpt-every 500` with `--num-envs 24`; raise
+`--ckpt-every` further if tight.
 
 **Note — training-time `videos/*.mp4` do NOT show the noise patch.** The noise is
 overlaid on the agent's grayscale *observation* (which drives training), not on the

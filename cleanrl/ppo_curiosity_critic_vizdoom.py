@@ -85,7 +85,7 @@ class Args:
     """total timesteps of the experiments (paper default: 30M)"""
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
-    num_envs: int = 32
+    num_envs: int = 24
     """the number of parallel VizDoom processes (AsyncVectorEnv workers)"""
     num_steps: int = 128
     """the number of steps to run in each environment per policy rollout"""
@@ -153,11 +153,11 @@ class Args:
     """noisy-TV blend in [0,1]: obs[patch] = (1-alpha)*clean + alpha*noise. alpha=1 = full static (default); use <1 for the noise-level sweep"""
 
     # Visualization cadence (in PPO updates)
-    video_every: int = 200
+    video_every: int = 500
     """record a gameplay video every N updates (0 disables)"""
-    wm_panel_every: int = 100
+    wm_panel_every: int = 200
     """dump a WM prediction panel every N updates (0 disables)"""
-    heatmap_every: int = 100
+    heatmap_every: int = 200
     """dump visitation / intrinsic-reward heatmaps every N updates (0 disables)"""
     video_steps: int = 525
     """number of agent steps to roll out when recording a video"""
@@ -173,16 +173,18 @@ class Args:
     """number of steps for the maze-extent probe"""
 
     # Instrumentation (thorough logging so runs never need repeating)
-    eval_every: int = 100
+    eval_every: int = 200
     """held-out world-model accuracy eval cadence (updates)"""
-    ckpt_every: int = 200
+    ckpt_every: int = 500
     """periodic full-model checkpoint cadence (updates); 0 disables"""
     holdout_size: int = 10000
     """number of held-out deterministic transitions for the WM-accuracy eval (cached per seed)"""
     holdout_dir: str = "./vizdoom_holdout"
     """directory for the cached per-seed held-out transition sets"""
-    profile_timing: bool = True
-    """if toggled, time each component (reward/aux/WM/policy) with cuda syncs for accurate breakdowns"""
+    profile_timing: bool = False
+    """if toggled, force cuda-synchronized timing breakdowns on every update"""
+    profile_last_updates: int = 0
+    """run cuda-synchronized timing only for the last N updates; 0 disables automatic detailed profiling"""
     post_plot: bool = True
     """if toggled, generate per-run plots from this run's metrics.jsonl at normal training exit"""
     post_plot_dir: str = ""
@@ -1433,13 +1435,15 @@ if __name__ == "__main__":
     ext_values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     int_values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     next_frames = torch.zeros((args.num_steps, args.num_envs, 84, 84)).to(device)
+    obs_rms_frames = np.zeros((args.num_steps, args.num_envs, 84, 84), dtype=np.uint8)
     avg_returns = deque(maxlen=20)
     recent_goal_successes = deque(maxlen=100)
 
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
+    next_obs_np, _ = envs.reset(seed=args.seed)
+    next_obs_np = np.asarray(next_obs_np)
+    next_obs = torch.from_numpy(next_obs_np).to(device=device, dtype=torch.float32)
     next_done = torch.zeros(args.num_envs).to(device)
 
     # Initialize observation normalization for every method. RND uses it for reward, and the passive
@@ -1456,8 +1460,9 @@ if __name__ == "__main__":
             next_ob = []
     print("Done.")
     # resync next_obs with the env state after the warmup steps
-    next_obs, _ = envs.reset()
-    next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
+    next_obs_np, _ = envs.reset()
+    next_obs_np = np.asarray(next_obs_np)
+    next_obs = torch.from_numpy(next_obs_np).to(device=device, dtype=torch.float32)
 
     # Held-out deterministic transitions for the WM-accuracy eval (cached per seed; identical across methods).
     print("Preparing held-out WM-eval set...")
@@ -1480,7 +1485,7 @@ if __name__ == "__main__":
         )
     last_ep = {"avg": float("nan"), "ret": float("nan"), "len": float("nan")}  # latest episodic stats (for per-update plots)
 
-    def log_episode_infos(infos, curiosity_step_mean):
+    def log_episode_infos(infos):
         # gymnasium 1.x: infos["episode"] (dict of arrays) + "_episode" mask
         # gymnasium 0.29: infos["final_info"] (array of per-env dicts/None), episode r/l are arrays
         pairs = []
@@ -1507,17 +1512,16 @@ if __name__ == "__main__":
                 "charts/avg_episodic_return": float(np.mean(avg_returns)),
                 "charts/episodic_return": r,
                 "charts/episodic_length": length,
-                "charts/episode_curiosity_reward": curiosity_step_mean,
             }
             writer.add_scalar("charts/avg_episodic_return", episode_row["charts/avg_episodic_return"], global_step)
             writer.add_scalar("charts/episodic_return", r, global_step)
             writer.add_scalar("charts/episodic_length", length, global_step)
-            writer.add_scalar("charts/episode_curiosity_reward", curiosity_step_mean, global_step)
             if args.track:
                 wandb.log(episode_row)
             print(f"global_step={global_step}, episodic_return={r:.3f}")
 
     for update in range(1, args.num_iterations + 1):
+        is_final_update = update == args.num_iterations
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / args.num_iterations
             if policy_optimizer is not None:
@@ -1525,17 +1529,21 @@ if __name__ == "__main__":
 
         rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
-        ep_xs, ep_ys, ep_intr, ep_tv = [], [], [], []
+        ep_xs, ep_ys, ep_tv = [], [], []
         goal_hits_update = 0
         episode_ends_update = 0
         tt = {}  # per-update timing accumulators (seconds)
-        if args.profile_timing and device.type == "cuda":
+        profile_this_update = args.profile_timing or (
+            args.profile_last_updates > 0 and update > args.num_iterations - args.profile_last_updates
+        )
+        if profile_this_update and device.type == "cuda":
             torch.cuda.synchronize()
         _t_rollout0 = time.perf_counter()
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
             obs[step] = next_obs
+            obs_rms_frames[step] = next_obs_np[:, 3, :, :]
             dones[step] = next_done
 
             with torch.no_grad():
@@ -1554,7 +1562,7 @@ if __name__ == "__main__":
             done = np.logical_or(terminated, truncated)
             next_obs_np = np.asarray(next_obs_np)
             rewards[step] = torch.tensor(reward_np, dtype=torch.float32, device=device).view(-1)
-            next_obs = torch.Tensor(next_obs_np).to(device)
+            next_obs = torch.from_numpy(next_obs_np).to(device=device, dtype=torch.float32)
             next_done = torch.Tensor(done.astype(np.float32)).to(device)
             next_frames[step] = next_obs[:, 3, :, :]
             goal_mask = reward_np > 0.0
@@ -1573,7 +1581,7 @@ if __name__ == "__main__":
                 action_onehot = F.one_hot(action.long(), num_classes=num_actions).float()
                 with torch.no_grad():
                     if args.method == "rnd":
-                        with _Timer(tt, "reward_aux", args.profile_timing, device):
+                        with _Timer(tt, "reward_aux", profile_this_update, device):
                             pred_f, targ_f = rnd_model(target_next)
                         intr = (targ_f - pred_f).pow(2).sum(1) / 2
                     else:
@@ -1586,7 +1594,7 @@ if __name__ == "__main__":
                             err_prev = _reward_error_per_sample(wm_pred_prev, target_next)
                             intr = (err_prev - err_before).clamp(min=0)
                         else:  # cc
-                            with _Timer(tt, "reward_aux", args.profile_timing, device):
+                            with _Timer(tt, "reward_aux", profile_this_update, device):
                                 critic_pred = neural_critic(obs_norm, action_onehot).squeeze(-1).clamp(min=0)
                             intr = (err_before - critic_pred).clamp(min=0)
                     curiosity_rewards[step] = intr.detach()
@@ -1596,21 +1604,20 @@ if __name__ == "__main__":
             if px is not None and py is not None:
                 ep_xs.extend(np.asarray(px).tolist())
                 ep_ys.extend(np.asarray(py).tolist())
-                ep_intr.extend(curiosity_rewards[step].cpu().numpy().tolist())
                 tvz = infos.get("in_tv_zone")
                 ep_tv.extend(np.asarray(tvz).tolist() if tvz is not None else [0] * args.num_envs)
 
-            log_episode_infos(infos, float(curiosity_rewards[step].mean().item()))
+            log_episode_infos(infos)
 
-        if args.profile_timing and device.type == "cuda":
+        if profile_this_update and device.type == "cuda":
             torch.cuda.synchronize()
         tt["rollout"] = time.perf_counter() - _t_rollout0
+        raw_curiosity_np = curiosity_rewards.detach().cpu().numpy()
+        raw_intr_flat = raw_curiosity_np.reshape(-1)
 
         # ---- normalize intrinsic rewards ----
         if use_intrinsic:
-            curiosity_reward_per_env = np.array(
-                [discounted_reward.update(r) for r in curiosity_rewards.cpu().data.numpy().T]
-            )
+            curiosity_reward_per_env = np.array([discounted_reward.update(r) for r in raw_curiosity_np.T])
             mean, std, count = (
                 np.mean(curiosity_reward_per_env),
                 np.std(curiosity_reward_per_env),
@@ -1662,7 +1669,7 @@ if __name__ == "__main__":
             b_ext_values = ext_values.reshape(-1)
             b_advantages = b_int_advantages * int_coef + b_ext_advantages * args.ext_coef
 
-        obs_rms.update(b_obs[:, 3, :, :].reshape(-1, 1, 84, 84).cpu().numpy())
+        obs_rms.update(obs_rms_frames.reshape(-1, 1, 84, 84))
         update_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         update_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
 
@@ -1678,7 +1685,7 @@ if __name__ == "__main__":
         v_loss = pg_loss = entropy_loss = approx_kl = old_approx_kl = torch.tensor(0.0, device=device)
         n_mb = 0
         last_panel = None  # (obs_last, pred, true, critic_value) for WM viz
-        if args.profile_timing and device.type == "cuda":
+        if profile_this_update and device.type == "cuda":
             torch.cuda.synchronize()
         _t_update0 = time.perf_counter()
         for epoch in range(args.update_epochs):
@@ -1701,7 +1708,7 @@ if __name__ == "__main__":
                 aux_actions_onehot = F.one_hot(mb_actions_long[aux_idx], num_classes=num_actions).float()
 
                 # world model -- trained for EVERY method (passive for rnd/ppo/random)
-                with _Timer(tt, "wm_update", args.profile_timing, device):
+                with _Timer(tt, "wm_update", profile_this_update, device):
                     wm_pred = world_model(aux_obs_norm, aux_actions_onehot)
                     wm_loss = _update_loss_per_sample(wm_pred, aux_target.detach()).mean()
                 err_before_sum += _reward_error_per_sample(wm_pred.detach(), aux_target).mean().item()
@@ -1710,7 +1717,7 @@ if __name__ == "__main__":
                 # RND predictor (aux) -- trained in the combined loss for rnd only
                 rnd_loss = torch.tensor(0.0, device=device)
                 if uses_rnd:
-                    with _Timer(tt, "aux_update", args.profile_timing, device):
+                    with _Timer(tt, "aux_update", profile_this_update, device):
                         pred_f, targ_f = rnd_model(aux_target)
                         rnd_loss = F.mse_loss(pred_f, targ_f.detach(), reduction="none").mean(-1).mean()
                     fwd_loss_log = rnd_loss.item()
@@ -1766,7 +1773,7 @@ if __name__ == "__main__":
 
                 # neural critic (aux) regresses the post-WM-update error on the same samples
                 if uses_critic:
-                    with _Timer(tt, "aux_update", args.profile_timing, device):
+                    with _Timer(tt, "aux_update", profile_this_update, device):
                         with torch.no_grad():
                             post_pred = world_model(aux_obs_norm, aux_actions_onehot)
                             err_after = _reward_error_per_sample(post_pred, aux_target).detach()
@@ -1780,7 +1787,7 @@ if __name__ == "__main__":
                     critic_pred_sum += critic_pred_train.detach().clamp(min=0).mean().item()
 
                 # stash one minibatch sample for the WM-prediction panel (every method trains a WM now)
-                if last_panel is None and args.wm_panel_every and update % args.wm_panel_every == 0:
+                if last_panel is None and args.wm_panel_every and (update % args.wm_panel_every == 0 or is_final_update):
                     with torch.no_grad():
                         cv = float(neural_critic(aux_obs_norm[:1], aux_actions_onehot[:1]).item()) if uses_critic else None
                         pred_raw = (world_model(aux_obs_norm[:1], aux_actions_onehot[:1]) * update_obs_std + update_obs_mean)
@@ -1794,13 +1801,13 @@ if __name__ == "__main__":
 
             if args.target_kl is not None and not is_random and approx_kl > args.target_kl:
                 break
-        if args.profile_timing and device.type == "cuda":
+        if profile_this_update and device.type == "cuda":
             torch.cuda.synchronize()
         tt["update"] = time.perf_counter() - _t_update0
 
         # ---- held-out world-model accuracy (every method trains a WM) ----
         wm_holdout = float("nan")
-        if args.eval_every and update % args.eval_every == 0:
+        if args.eval_every and (update % args.eval_every == 0 or is_final_update):
             _t_eval0 = time.perf_counter()
             wm_holdout = eval_wm_holdout(world_model, holdout, obs_rms, num_actions, device)
             tt["eval"] = time.perf_counter() - _t_eval0
@@ -1809,7 +1816,7 @@ if __name__ == "__main__":
         sps = int(global_step / (time.time() - start_time))
         tt["total"] = tt.get("rollout", 0.0) + tt.get("update", 0.0)
         tv_arr = np.asarray(ep_tv, dtype=bool)
-        intr_arr = np.asarray(ep_intr, dtype=np.float32)
+        intr_arr = raw_intr_flat[: len(ep_tv)].astype(np.float32, copy=False) if len(ep_tv) else np.asarray([], dtype=np.float32)
         tv_count = int(tv_arr.sum()) if tv_arr.size else 0
         non_tv_count = int((~tv_arr).sum()) if tv_arr.size else 0
         policy_lr = policy_optimizer.param_groups[0]["lr"] if policy_optimizer is not None else wm_optimizer.param_groups[0]["lr"]
@@ -1839,6 +1846,7 @@ if __name__ == "__main__":
             "time/aux_update_s": tt.get("aux_update", 0.0),
             "time/aux_total_s": tt.get("reward_aux", 0.0) + tt.get("aux_update", 0.0),
             "time/eval_s": tt.get("eval", 0.0),
+            "time/profile_timing_active": float(profile_this_update),
         }
         if not is_random:
             row["losses/value_loss"] = float(v_loss.item())
@@ -1873,7 +1881,7 @@ if __name__ == "__main__":
         print(f"update={update} SPS={sps} wm_holdout={wm_holdout:.2f}")
 
         # ---- periodic full checkpoint (so any instant can be reconstructed without rerunning) ----
-        if args.ckpt_every and update % args.ckpt_every == 0:
+        if args.ckpt_every and (update % args.ckpt_every == 0 or is_final_update):
             save_full_checkpoint(
                 f"{ckpt_dir}/ckpt_update{update:06d}.cleanrl_model", args, global_step, update,
                 agent, world_model, neural_critic, rnd_model, obs_rms, reward_rms, world_model_prev=world_model_prev,
@@ -1884,12 +1892,12 @@ if __name__ == "__main__":
             p = save_wm_panel(f"{viz_dir}/wm_panel_update{update:06d}.png", *last_panel)
             if p and args.track:
                 wandb.log({"global_step": global_step, "viz/wm_panel": wandb.Image(p)})
-        if args.heatmap_every and update % args.heatmap_every == 0:
+        if args.heatmap_every and (update % args.heatmap_every == 0 or is_final_update):
             p = save_heatmaps(
                 f"{viz_dir}/heatmap_update{update:06d}.png",
                 ep_xs,
                 ep_ys,
-                ep_intr,
+                intr_arr,
                 ep_tv,
                 map_lines=viz_map_lines,
             )
@@ -1900,10 +1908,10 @@ if __name__ == "__main__":
                 f"{viz_dir}/positions_update{update:06d}.npz",
                 x=np.asarray(ep_xs, dtype=np.float32),
                 y=np.asarray(ep_ys, dtype=np.float32),
-                intr=np.asarray(ep_intr, dtype=np.float32),
+                intr=intr_arr,
                 in_tv=np.asarray(ep_tv, dtype=np.float32),
             )
-        if args.capture_video and args.video_every and update % args.video_every == 0:
+        if args.capture_video and args.video_every and (update % args.video_every == 0 or is_final_update):
             map_video_path = f"{map_video_dir}/update{update:06d}.mp4"
             p = capture_video(
                 f"{video_dir}/update{update:06d}.mp4",
