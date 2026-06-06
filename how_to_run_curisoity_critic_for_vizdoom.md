@@ -97,7 +97,7 @@ starting room. If it is too small/large, adjust `--tv-radius` (game units; defau
 Per `next-steps-for-paper-plan.md`:
 
 - Scenario: `sparse` (primary). `very_sparse` optional for extra exploration stress.
-- Seeds: **`cc` and `rnd` → seeds 1–5**; **`c_v1`, `c_v2`, `ppo`, `random` → seeds 1–3**.
+- Seeds: **all methods → seeds 1–5** (uniform).
 - `--total-timesteps 30000000` (30M) per run.
 
 Use `tmux` so jobs survive disconnects:
@@ -124,8 +124,8 @@ for SEED in 1 2 3 4 5; do
   done
 done
 
-# Curiosity V1 (special case, zero baseline): seeds 1-3
-for SEED in 1 2 3; do
+# Curiosity V1 (special case, zero baseline): seeds 1-5
+for SEED in 1 2 3 4 5; do
   python cleanrl/ppo_curiosity_critic_vizdoom.py \
     --method c_v1 --scenario sparse --noisy-tv \
     --total-timesteps 30000000 --seed $SEED \
@@ -151,7 +151,7 @@ for SEED in 1 2 3 4 5; do
   done
 done
 
-for SEED in 1 2 3; do
+for SEED in 1 2 3 4 5; do
   for METHOD in c_v1 c_v2 ppo random; do
     python cleanrl/ppo_curiosity_critic_vizdoom.py \
       --method $METHOD --scenario sparse \
@@ -167,7 +167,7 @@ done
 ```bash
 PROJECT=curiosity-critic-vizdoom
 
-for SEED in 1 2 3; do
+for SEED in 1 2 3 4 5; do
   for METHOD in c_v2 ppo random; do
     python cleanrl/ppo_curiosity_critic_vizdoom.py \
       --method $METHOD --scenario sparse --noisy-tv \
@@ -227,6 +227,37 @@ The **headline visual** is the noisy-TV trap, built from Phase 1 runs:
 
 If `--track` is on, all three are also logged to W&B under `viz/` (and videos under
 `viz/video`), so you can pull them straight from the run page.
+
+### Noise-overlaid videos (post-hoc, for the talk)
+
+The training-time `videos/*.mp4` do **not** show the noise patch: the noise is
+overlaid on the agent's grayscale *observation* (which drives training), not on the
+RGB buffer used to render the video. To produce presentation videos with the noisy
+TV visible, regenerate them from the saved `--save-model` checkpoints with the
+standalone tool — this does not touch the training code and needs no re-runs:
+
+```bash
+# one run:
+python cleanrl/regenerate_vizdoom_video.py \
+    --checkpoint runs/<run_name>/ppo_curiosity_critic_vizdoom.cleanrl_model
+
+# batch over every noisy Phase-1 run:
+for f in runs/vizdoom_sparse_noisytv__*/ppo_curiosity_critic_vizdoom.cleanrl_model; do
+    python cleanrl/regenerate_vizdoom_video.py --checkpoint "$f"
+done
+```
+
+Each invocation writes **two** mp4s next to the checkpoint:
+- `<checkpoint>_noisyTV.mp4` — pretty full-res RGB with the noise patch re-overlaid (a
+  faithful *reconstruction* of what the agent experienced).
+- `<checkpoint>_obs.mp4` — the agent's **actual observation**: the exact grayscale pixels
+  it saw (including the real noise it acted on), nearest-neighbor upscaled (`--obs-scale`).
+
+Useful flags: `--greedy` (argmax actions for a cleaner deterministic clip), `--steps`
+(rollout length), `--seed`, `--out`, `--obs-scale`. The script replays the run's own
+saved config and prints the TV-zone fraction (≈0.1 for CC, ≈1.0 for RND) as a sanity
+check. These replay the final policy, so they are the end-of-training "money shot" — CC
+reaching the vest vs. RND stuck on the static, now with the static on screen.
 
 ---
 

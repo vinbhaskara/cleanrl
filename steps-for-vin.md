@@ -98,11 +98,11 @@ If SPS is low, raise `--num-envs` toward your CPU core count and re-check.
 ## Step 4 — Full runs (Phases 1–3)
 
 Follow `how_to_run_curisoity_critic_for_vizdoom.md` §3, in `tmux`:
-- **Phase 1 (headline):** noisy-TV — `cc`, `rnd` (seeds 1–5) and `c_v1` (seeds 1–3).
+- **Phase 1 (headline):** noisy-TV — `cc`, `rnd`, `c_v1` (all seeds 1–5).
 - **Phase 2:** plain MyWayHome — full method set.
 - **Phase 3:** finish noisy-TV baselines (`c_v2`, `ppo`, `random`).
 
-Seeds: `cc`/`rnd` → 1–5; `c_v1`/`c_v2`/`ppo`/`random` → 1–3. All at
+Seeds: all methods → 1–5 (uniform). All at
 `--total-timesteps 30000000`, with `--track --save-model --capture-video`.
 
 ## Step 5 — Collect the presentation visuals
@@ -113,6 +113,25 @@ From the Phase-1 noisy-TV runs (see how-to §5):
 3. WM-prediction panel showing the critic baseline subtracting the noise region.
 
 All also appear in W&B under `viz/` when `--track` is on.
+
+**Note — training-time `videos/*.mp4` do NOT show the noise patch.** The noise is
+overlaid on the agent's grayscale *observation* (which drives training), not on the
+RGB buffer used for the video. To get presentation videos with the noisy TV visible,
+regenerate them post-hoc from the saved checkpoints (no re-runs, training untouched):
+
+```bash
+# one run:
+python cleanrl/regenerate_vizdoom_video.py \
+  --checkpoint runs/<run_name>/ppo_curiosity_critic_vizdoom.cleanrl_model
+# batch every noisy Phase-1 run:
+for f in runs/vizdoom_sparse_noisytv__*/ppo_curiosity_critic_vizdoom.cleanrl_model; do
+  python cleanrl/regenerate_vizdoom_video.py --checkpoint "$f"; done
+```
+
+Each writes two mp4s: `<checkpoint>_noisyTV.mp4` (pretty RGB reconstruction) and
+`<checkpoint>_obs.mp4` (the agent's exact observation — the real grayscale pixels it
+saw, upscaled). Add `--greedy` for a cleaner deterministic clip. The script prints the
+TV-zone fraction (≈0.1 for CC, ≈1.0 for RND) as a check.
 
 ---
 

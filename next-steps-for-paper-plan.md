@@ -45,8 +45,7 @@ V1 and V2 reuse the Curiosity-Critic world model and serve as the zero-baseline 
 
 ## 4. Seeds
 
-- **Curiosity-Critic, RND, ICM:** 5 seeds (the headline comparison).
-- **PPO, V1, V2, Disagreement:** 3 seeds.
+- **All methods: 5 seeds** (uniform — cleaner for TMLR, no awkward per-method seed counts to justify).
 
 ---
 
@@ -56,7 +55,7 @@ V1 and V2 reuse the Curiosity-Critic world model and serve as the zero-baseline 
 Build the VizDoom training harness, run a short job, and record steps-per-second and the per-run frame budget.
 
 **Phase 1 — Headline (noisy-TV).**
-Run {Curiosity-Critic, RND, ICM, V1} on the noisy-TV condition, 5/5/5/3 seeds. This produces the core result and the presentation footage.
+Run {Curiosity-Critic, RND, ICM, V1} on the noisy-TV condition, 5 seeds each. This produces the core result and the presentation footage.
 
 **Phase 2 — Deterministic (plain).**
 Run the full method set on the plain condition.
