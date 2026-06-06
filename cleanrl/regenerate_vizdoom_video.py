@@ -74,6 +74,7 @@ def main():
     agent.load_state_dict(ckpt["policy_model"])
     agent.eval()
 
+    method = saved.get("method", args.method)
     rng = np.random.default_rng(cli.seed)
     obs, info = env.reset(seed=cli.seed)
     rgb_frames, obs_frames, tv_steps = [], [], 0
@@ -83,20 +84,29 @@ def main():
             # Newest grayscale frame = exactly the view the agent acts on, including the real
             # noise the NoisyTVWrapper drew into the observation.
             obs_frames.append(obs_arr[-1].copy())
-            obs_t = torch.tensor(obs_arr, dtype=torch.float32, device=device).unsqueeze(0)
-            if cli.greedy:
-                hidden = agent.network(obs_t / 255.0)
-                action = torch.argmax(agent.actor(hidden), dim=1)
+            if method == "random":
+                action_i = int(rng.integers(0, n_actions))
             else:
-                action, _, _, _, _ = agent.get_action_and_value(obs_t)
-            obs, _, term, trunc, info = env.step(int(action.item()))
+                obs_t = torch.tensor(obs_arr, dtype=torch.float32, device=device).unsqueeze(0)
+                if cli.greedy:
+                    hidden = agent.network(obs_t / 255.0)
+                    action = torch.argmax(agent.actor(hidden), dim=1)
+                else:
+                    action, _, _, _, _ = agent.get_action_and_value(obs_t)
+                action_i = int(action.item())
+            obs, _, term, trunc, info = env.step(action_i)
 
             frame = np.array(info["rgb"], dtype=np.uint8)  # copy; don't mutate env buffer
             if info.get("in_tv_zone"):
                 tv_steps += 1
                 rh = max(1, int(frame.shape[0] * args.tv_panel / OBS_SIZE))
                 rw = max(1, int(frame.shape[1] * args.tv_panel / OBS_SIZE))
-                frame[:rh, :rw] = rng.integers(0, 256, size=(rh, rw, 1), dtype=np.uint8)
+                noise = rng.integers(0, 256, size=(rh, rw, 1), dtype=np.uint8)
+                if args.noise_alpha >= 1.0:
+                    frame[:rh, :rw] = noise
+                else:  # match the observation's blend so sweep videos show the right intensity
+                    blended = (1.0 - args.noise_alpha) * frame[:rh, :rw].astype(np.float32) + args.noise_alpha * noise
+                    frame[:rh, :rw] = np.rint(blended).astype(np.uint8)
             rgb_frames.append(frame)
             if term or trunc:
                 obs, info = env.reset()

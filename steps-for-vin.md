@@ -18,7 +18,7 @@ Reasons:
 - The smoke test (minutes, full training loop + viz) is the *second* gate, run
   only after preflight is green.
 
-Order: **preflight → smoke test → Phases 1–3.**
+Order: **preflight → smoke test → sparse Phases 1–4 → very-sparse stress Phase 5.**
 
 ---
 
@@ -30,8 +30,12 @@ build artifacts) and is avoided on purpose:
 
 ```bash
 git add .gitignore \
+        cleanrl/build_holdout.py \
+        cleanrl/plot_vizdoom_curiosity.py \
         cleanrl/ppo_curiosity_critic_vizdoom.py \
+        cleanrl/regenerate_vizdoom_video.py \
         how_to_run_curisoity_critic_for_vizdoom.md \
+        next-steps-for-paper-plan.md \
         preflight_readme.md \
         steps-for-vin.md \
         vizdoom_scenarios/
@@ -61,6 +65,18 @@ pip install vizdoom opencv-python matplotlib
 ls vizdoom_scenarios/   # expect the 3 my_way_home_*.wad files (bundled in the repo)
 ```
 
+## Step 1.5 — Build the held-out WM-eval sets (run once)
+
+```bash
+python cleanrl/build_holdout.py --scenario sparse --seeds 1 2 3 --size 2048
+python cleanrl/build_holdout.py --scenario very_sparse --seeds 1 2 3 --size 2048
+```
+
+Writes `vizdoom_holdout/holdout_{sparse,very_sparse}_seed{1,2,3}.npz` + a **coverage heatmap
+overlaid on the top-down maze map** per seed/scenario. Open the 6 `*_coverage.png` files and confirm
+samples span rooms and corridors (not just spawn / wall-bump loops). All methods of a seed score
+their world model on the matching-seed/scenario set, so it must be built before the runs.
+
 ## Step 2 — PREFLIGHT (the fast gate)  ← run this first
 
 ```bash
@@ -88,24 +104,60 @@ python cleanrl/ppo_curiosity_critic_vizdoom.py \
 ```
 
 Confirm in `runs/<run_name>/`:
-- a healthy, steady `SPS:` (× 86,400 ≈ frames/day; a 30M run should fit under a day),
-- `viz/wm_panel_*.png`, `viz/heatmap_*.png`, and `videos/*.mp4` are produced and look sane.
+- a healthy, steady `SPS:` (× 86,400 ≈ agent steps/day; a 30M run should fit under a day),
+- `viz/wm_panel_*.png`, maze-overlaid `viz/heatmap_*.png`, `videos/*.mp4`, and
+  `map_vids/*.mp4` are produced and look sane.
+- if `--track` is on, W&B charts should use `global_step` as the x-axis. That is total
+  vectorized env interactions (`num_envs × env steps`), so a 30M run should span roughly
+  0 → 30,000,000 rather than update/logging count.
+- at normal completion, `runs/<run_name>/plots/` is created automatically from that run's
+  `metrics.jsonl` for quick per-run inspection.
+
+Then test the post-run analysis loop too:
+
+```bash
+python cleanrl/plot_vizdoom_curiosity.py --runs-dir runs --out paper_figures/vizdoom_smoke
+```
+
+Confirm it writes PNG plots plus `paper_figures/vizdoom_smoke/summary_final_metrics.csv`.
 
 If SPS is low, raise `--num-envs` toward your CPU core count and re-check.
 
 **Gate: do not launch the full matrix until the smoke test looks right.**
 
-## Step 4 — Full runs (Phases 1–3)
+## Step 4 — Full runs (Phases 1–5)
 
 Follow `how_to_run_curisoity_critic_for_vizdoom.md` §3, in `tmux`:
-- **Phase 1 (headline):** noisy-TV — `cc`, `rnd`, `c_v1` (all seeds 1–5).
+- **Phase 1 (headline):** noisy-TV — `cc`, `rnd`, `c_v2` (3 seeds). `c_v2` is promoted here (closest competitor → early signal on whether the learned baseline is the real win).
 - **Phase 2:** plain MyWayHome — full method set.
-- **Phase 3:** finish noisy-TV baselines (`c_v2`, `ppo`, `random`).
+- **Phase 3:** finish noisy-TV baselines (`c_v1`, `ppo`, `random`).
+- **Phase 4:** sparse noisy-TV mini noise-α sweep (`cc`, `c_v2`, `rnd` only; α=0.33, 0.66).
+- **Phase 5:** very-sparse stress matrix — `cc`, `rnd`, `c_v2` only, plain + full noisy-TV.
 
-Seeds: all methods → 1–5 (uniform). All at
-`--total-timesteps 30000000`, with `--track --save-model --capture-video`.
+Seeds: all methods/scenarios → 1–3 (uniform; report IQM-style curves + bootstrap CIs). All at
+`--total-timesteps 30000000`, with `--track --save-model --capture-video`. Sparse remains the
+primary TMLR matrix; very-sparse is the stress-test appendix/secondary result.
 
-## Step 5 — Collect the presentation visuals
+## Step 5 — Generate paper figures (rerun after each phase)
+
+```bash
+python cleanrl/plot_vizdoom_curiosity.py --runs-dir runs --out paper_figures/vizdoom
+```
+
+Each individual job also writes quick single-run plots to `runs/<run_name>/plots/` at normal exit.
+This command is the aggregate paper-figure pass: it reads every completed `runs/*/metrics.jsonl`,
+groups by scenario / condition / method / seed, and writes IQM-style curves with bootstrap CIs plus
+`summary_final_metrics.csv`. Rerun it whenever a job or phase finishes; it is incremental and will
+use whatever completed runs are present. It also filters obvious short-planned smoke runs once
+full-planned runs exist, and keeps only the longest run for each scenario / condition / method / seed.
+
+Key plots to inspect:
+- sparse noisy-TV: return, goal-rate, TV-zone fraction, held-out WM error,
+- sparse plain: return and held-out WM error,
+- sparse noise-α sweep: the α-specific noisy-TV curves,
+- very-sparse stress: `cc`/`rnd`/`c_v2` plain + full noisy-TV.
+
+## Step 6 — Collect the presentation visuals
 
 From the Phase-1 noisy-TV runs (see how-to §5):
 1. side-by-side video: `rnd`/`c_v1` fixating on the TV vs. `cc` reaching the vest,
@@ -113,6 +165,14 @@ From the Phase-1 noisy-TV runs (see how-to §5):
 3. WM-prediction panel showing the critic baseline subtracting the noise region.
 
 All also appear in W&B under `viz/` when `--track` is on.
+
+**Every run is now fully instrumented (so you never have to rerun):** `metrics.jsonl`
+(all scalars/update), periodic full `checkpoints/`, held-out world-model accuracy
+(`eval/wm_holdout_l2`, comparable across all methods since every method trains a WM),
+`time/*` compute breakdowns, `charts/*_periodic` dense return plots, `viz/positions_*.npz`
+raw heatmap data, RGB + exact-observation videos, and top-down `map_vids/` trajectory
+videos, plus automatic per-run `plots/`. See how-to §5b. Disk: periodic checkpoints ≈ 1 GB / 30M run; raise `--ckpt-every`
+if tight.
 
 **Note — training-time `videos/*.mp4` do NOT show the noise patch.** The noise is
 overlaid on the agent's grayscale *observation* (which drives training), not on the
@@ -138,7 +198,7 @@ TV-zone fraction (≈0.1 for CC, ≈1.0 for RND) as a check.
 ## Decision gates at a glance
 
 ```
-preflight (cc+rnd) PASS ──► smoke test sane ──► Phase 1 ──► Phases 2–3 ──► visuals
+preflight (cc+rnd) PASS ──► smoke + plot loop sane ──► sparse Phases 1–4 ──► very-sparse Phase 5 ──► figures/visuals
         │                        │
         └─ fix per preflight_readme.md
                                  └─ raise --num-envs / fix viz, re-run

@@ -35,40 +35,51 @@ Observation format matches the existing harness: 84×84 grayscale, 4-frame stack
 | Curiosity V1 (raw WM error) | ✓ | ✓ |
 | Curiosity V2 (one-step improvement) | ✓ | ✓ |
 | RND | ✓ | ✓ |
-| ICM | ✓ | ✓ |
 | **Curiosity-Critic (ours)** | ✓ | ✓ |
-| Disagreement | — | ✓ |
 
 V1 and V2 reuse the Curiosity-Critic world model and serve as the zero-baseline and one-step-baseline ablations of our framework.
+ICM and Disagreement are de-scoped for the TMLR version; the VizDoom section focuses on RND,
+PPO/random floors, and the V1/V2 ablations that isolate the Curiosity-Critic baseline.
 
 ---
 
 ## 4. Seeds
 
-- **All methods: 5 seeds** (uniform — cleaner for TMLR, no awkward per-method seed counts to justify).
+- **All methods: 3 seeds** (uniform; de-scoped from 5 to keep the matrix tractable). Report IQM-style curves + bootstrap CIs so 3 seeds stays credible.
+- **C_V2 is in the early/main wave alongside CC and RND** (it's the closest competitor — the one-step-baseline special case — so an early read on it tells us whether the learned baseline is the real win).
+- **Mini noise-α sweep:** intermediate noise levels **α ∈ {0.33, 0.66}** for **CC, C_V2, RND only**, 3 seeds. Endpoints are already covered: α=0 = the plain/deterministic runs, α=1 = the full-noise runs. Noise model = convex blend `obs[patch] = (1−α)·clean + α·noise` (resampled each step; α=1 reproduces the current full-noise patch).
+- **Very-sparse stress matrix:** `very_sparse` scenario for **CC, C_V2, RND only**, 3 seeds,
+  in plain and full noisy-TV (α=1) conditions. No intermediate α sweep on very-sparse.
 
 ---
 
 ## 5. Execution order
 
 **Phase 0 — Harness and smoke test.**
-Build the VizDoom training harness, run a short job, and record steps-per-second and the per-run frame budget.
+Build the VizDoom training harness, run a short job, and record steps-per-second and the per-run step budget.
 
 **Phase 1 — Headline (noisy-TV).**
-Run {Curiosity-Critic, RND, ICM, V1} on the noisy-TV condition, 5 seeds each. This produces the core result and the presentation footage.
+Run {Curiosity-Critic, RND, Curiosity V2} on the noisy-TV condition first (C_V2 promoted — closest competitor, early signal), 3 seeds each. This produces the core result and the presentation footage.
 
 **Phase 2 — Deterministic (plain).**
 Run the full method set on the plain condition.
 
 **Phase 3 — Completion.**
-Run V2 (both conditions) and Disagreement (noisy-TV). Finalize all seed counts per Section 4.
+Finish the sparse noisy-TV baselines (`c_v1`, PPO, random). Finalize all seed counts per Section 4.
+
+**Phase 4 — Sparse noise-level sweep.**
+Run intermediate noise levels α ∈ {0.33, 0.66} for CC, C_V2, and RND only.
+
+**Phase 5 — Very-sparse stress test.**
+Run CC, C_V2, and RND on `very_sparse`, in plain and full noisy-TV conditions.
 
 ---
 
 ## 6. Compute
 
-- Each run: **30M frames**, ~8–12 hours on the 3090 Ti.
-- Total matrix: ~51 runs, ~3.5 weeks of serial GPU time.
+- Each run: **30M agent-environment steps** (~120M repeated Doom tics with `frame_skip=4`), ~8–12 hours on the 3090 Ti.
+- Sparse primary matrix: 54 runs. Very-sparse stress matrix: 18 additional runs.
+- Total TMLR matrix: 72 runs, ~3.5-5 weeks of serial GPU time depending on measured SPS.
 - Each run stays at or under the 1-day-per-seed-per-method budget.
 
 ---
@@ -77,12 +88,17 @@ Run V2 (both conditions) and Disagreement (noisy-TV). Finalize all seed counts p
 
 Produced for every run, used in both the paper and the company presentation:
 
-- Episodic return vs. environment frames (primary).
-- Maze goal-reached rate.
-- Intrinsic reward on the noise region vs. the rest of the maze (mechanism plot).
+- Episodic return vs. agent-environment steps (primary).
+- Maze goal-reached rate (`charts/goal_reached_rate_100ep`; positive reward = vest collection).
+- TV-zone visitation fraction (`mechanism/tv_zone_fraction`).
+- Intrinsic reward on the noise region vs. the rest of the maze
+  (`mechanism/intrinsic_tv_mean_raw` vs. `mechanism/intrinsic_non_tv_mean_raw`).
+- Held-out clean world-model error (`eval/wm_holdout_l2`) on fixed deterministic transition sets.
 - Curiosity-Critic baseline estimate over training.
-- Side-by-side gameplay video: RND/ICM agent fixating on the noisy TV vs. Curiosity-Critic agent ignoring it and reaching the goal.
+- Side-by-side gameplay video: RND agent fixating on the noisy TV vs. Curiosity-Critic agent ignoring it and reaching the goal.
 - World-model panel: predicted next frame, actual next frame, error map, critic baseline.
+- Paper figures generated from `metrics.jsonl` via `cleanrl/plot_vizdoom_curiosity.py`
+  (IQM-style curves + bootstrap CIs, plus final-metric CSV summaries).
 
 ---
 
@@ -103,10 +119,10 @@ Produced for every run, used in both the paper and the company presentation:
 2. Add the very-sparse scenario as a selectable variant.
 3. Implement the noisy-TV observation wrapper: a fixed rectangular panel re-sampling i.i.d. noise every step, with fixed documented geometry and intensity, exposing the noise-region mask for logging.
 4. Fork `cleanrl/ppo_curiosity_critic_vizdoom.py` from the existing Curiosity-Critic script; swap in the vectorized ViZDoom env; keep the world model, neural critic, PPO, GAE, and reward pipeline unchanged.
-5. Implement the baselines behind a single `--method` flag: PPO (no intrinsic), Curiosity V1, Curiosity V2, RND, ICM, Curiosity-Critic. Disagreement is added last, after the others are validated.
+5. Implement the baselines behind a single `--method` flag: PPO (no intrinsic), Curiosity V1, Curiosity V2, RND, Curiosity-Critic, plus random exploration floor.
 6. Implement logging and presentation hooks: TensorBoard + wandb scalars; episode video capture; world-model image panels (predicted / actual / error / baseline); maze visitation and intrinsic-reward heatmaps from the POSITION variables; per-region intrinsic-reward curves (TV panel vs. rest).
-7. Phase 0 smoke test on the Linux box: confirm steps-per-second and the 30M-frame run budget.
-8. Run Phases 1–3 per Section 5.
+7. Phase 0 smoke test on the Linux box: confirm steps-per-second and the 30M-step run budget.
+8. Run Phases 1–5 per Section 5.
 
 ---
 

@@ -36,8 +36,11 @@
 # visitation + intrinsic-reward heatmaps (from VizDoom POSITION game variables),
 # and periodic gameplay videos.
 import functools
+import json
 import os
 import random
+import re
+import struct
 import sys
 import time
 from collections import deque
@@ -67,9 +70,9 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "curiosity-critic-vizdoom"
+    wandb_project_name: str = "curiosity-critic-vizdoom-JUN2026"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
     capture_video: bool = False
     """if toggled, periodically record gameplay videos to runs/<run_name>/videos"""
@@ -109,7 +112,7 @@ class Args:
     """coefficient of the value function"""
     max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
-    target_kl: float = None
+    target_kl: Optional[float] = None
     """the target KL divergence threshold"""
 
     # Curiosity / intrinsic-reward arguments (kept identical to the Atari scripts)
@@ -147,6 +150,8 @@ class Args:
     """TV-zone radius (game units) around episode start; calibrated via --probe-maze for MyWayHome sparse (max reach ~516)"""
     tv_panel: int = 42
     """side length (pixels, in the 84x84 frame) of the square noise panel"""
+    noise_alpha: float = 1.0
+    """noisy-TV blend in [0,1]: obs[patch] = (1-alpha)*clean + alpha*noise. alpha=1 = full static (default); use <1 for the noise-level sweep"""
 
     # Visualization cadence (in PPO updates)
     video_every: int = 200
@@ -167,6 +172,22 @@ class Args:
     """if toggled, drive a forward-biased policy to estimate maze extent, recommend --tv-radius, and exit"""
     probe_maze_steps: int = 3000
     """number of steps for the maze-extent probe"""
+
+    # Instrumentation (thorough logging so runs never need repeating)
+    eval_every: int = 100
+    """held-out world-model accuracy eval cadence (updates)"""
+    ckpt_every: int = 200
+    """periodic full-model checkpoint cadence (updates); 0 disables"""
+    holdout_size: int = 1024
+    """number of held-out deterministic transitions for the WM-accuracy eval (cached per seed)"""
+    holdout_dir: str = "./vizdoom_holdout"
+    """directory for the cached per-seed held-out transition sets"""
+    profile_timing: bool = True
+    """if toggled, time each component (reward/aux/WM/policy) with cuda syncs for accurate breakdowns"""
+    post_plot: bool = True
+    """if toggled, generate per-run plots from this run's metrics.jsonl at normal training exit"""
+    post_plot_dir: str = ""
+    """directory for per-run post-training plots; empty means runs/<run_name>/plots"""
 
     # to be filled in at runtime
     batch_size: int = 0
@@ -240,17 +261,19 @@ class VizDoomEnv(gym.Env):
         self.action_space = gym.spaces.Discrete(n)
         self.observation_space = gym.spaces.Box(low=0, high=255, shape=(84, 84), dtype=np.uint8)
         self._last_rgb = np.zeros((120, 160, 3), dtype=np.uint8)
+        self._last_pos = (0.0, 0.0, 0.0)
 
     def _read_state(self):
         state = self.game.get_state()
         if state is None:
-            return self._last_rgb, (0.0, 0.0, 0.0)
+            return self._last_rgb, self._last_pos
         buf = state.screen_buffer
         if buf.ndim == 3 and buf.shape[0] == 3:  # CHW -> HWC defensive
             buf = np.transpose(buf, (1, 2, 0))
         gv = state.game_variables
         pos = (float(gv[0]), float(gv[1]), float(gv[2])) if gv is not None and len(gv) >= 3 else (0.0, 0.0, 0.0)
         self._last_rgb = buf
+        self._last_pos = pos
         return buf, pos
 
     @staticmethod
@@ -274,7 +297,8 @@ class VizDoomEnv(gym.Env):
         reward = self.game.make_action(self._actions[int(action)], self.frame_skip)
         terminated = self.game.is_episode_finished()
         rgb, pos = self._read_state()
-        info = {"position_x": pos[0], "position_y": pos[1], "position_angle": pos[2]}
+        # In sparse / very-sparse MyWayHome, positive reward corresponds to collecting the vest.
+        info = {"position_x": pos[0], "position_y": pos[1], "position_angle": pos[2], "goal_reached": bool(reward > 0.0)}
         if self.expose_rgb:
             info["rgb"] = rgb
         return self._to_obs(rgb), float(reward), bool(terminated), False, info
@@ -299,10 +323,11 @@ class NoisyTVWrapper(gym.Wrapper):
     maze-specific coordinates. ``info['in_tv_zone']`` is exposed for logging.
     """
 
-    def __init__(self, env, tv_radius: float, tv_panel: int, rng_seed: int = 0):
+    def __init__(self, env, tv_radius: float, tv_panel: int, noise_alpha: float = 1.0, rng_seed: int = 0):
         super().__init__(env)
         self.tv_radius = tv_radius
         self.tv_panel = tv_panel
+        self.noise_alpha = float(noise_alpha)
         self._rng = np.random.default_rng(rng_seed)
         self._start = None
 
@@ -315,7 +340,12 @@ class NoisyTVWrapper(gym.Wrapper):
         if in_zone:
             p = self.tv_panel
             obs = obs.copy()
-            obs[:p, :p] = self._rng.integers(0, 256, size=(p, p), dtype=np.uint8)
+            noise = self._rng.integers(0, 256, size=(p, p), dtype=np.uint8)
+            if self.noise_alpha >= 1.0:
+                obs[:p, :p] = noise  # full static (alpha=1, default) -- identical to prior behavior
+            else:
+                blended = (1.0 - self.noise_alpha) * obs[:p, :p].astype(np.float32) + self.noise_alpha * noise
+                obs[:p, :p] = np.rint(blended).astype(np.uint8)
         info["in_tv_zone"] = bool(in_zone)
         return obs, info
 
@@ -340,7 +370,9 @@ def _frame_stack(env, k=4):
 def _build_single_env(args: "Args", idx: int, seed: int, expose_rgb: bool = False):
     env = VizDoomEnv(args, idx=idx, seed=seed, expose_rgb=expose_rgb)
     if args.noisy_tv:
-        env = NoisyTVWrapper(env, tv_radius=args.tv_radius, tv_panel=args.tv_panel, rng_seed=seed)
+        env = NoisyTVWrapper(
+            env, tv_radius=args.tv_radius, tv_panel=args.tv_panel, noise_alpha=args.noise_alpha, rng_seed=seed
+        )
     env = _frame_stack(env, 4)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     return env
@@ -581,6 +613,283 @@ def _cpu_state_dict(module):
     return {key: value.detach().cpu() for key, value in module.state_dict().items()}
 
 
+class _Timer:
+    """Accumulate wall-time into a dict; optional cuda sync for accurate GPU-component timing."""
+
+    def __init__(self, store, key, sync, device):
+        self.store, self.key, self.sync, self.device = store, key, sync, device
+
+    def __enter__(self):
+        if self.sync and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self._t = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        if self.sync and self.device.type == "cuda":
+            torch.cuda.synchronize()
+        self.store[self.key] = self.store.get(self.key, 0.0) + (time.perf_counter() - self._t)
+
+
+def _git_commit():
+    try:
+        import subprocess
+
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return "unknown"
+
+
+def _read_wad_textmap(wad_path, doom_map="map01"):
+    """Read the UDMF TEXTMAP lump for a MAPxx marker from a WAD."""
+    doom_map = doom_map.upper()
+    with open(wad_path, "rb") as f:
+        magic = f.read(4)
+        if magic not in {b"IWAD", b"PWAD"}:
+            raise ValueError(f"{wad_path} is not a Doom WAD")
+        num_lumps, directory_offset = struct.unpack("<ii", f.read(8))
+        f.seek(directory_offset)
+        lumps = []
+        for _ in range(num_lumps):
+            offset, size, name = struct.unpack("<ii8s", f.read(16))
+            lumps.append((name.rstrip(b"\0").decode("ascii", "replace").upper(), offset, size))
+
+        textmap_idx = None
+        for i, (name, _, _) in enumerate(lumps):
+            if name == doom_map:
+                for j in range(i + 1, len(lumps)):
+                    if lumps[j][0] == "TEXTMAP":
+                        textmap_idx = j
+                        break
+                    if lumps[j][0] == "ENDMAP":
+                        break
+                break
+        if textmap_idx is None:
+            textmap_idx = next((i for i, lump in enumerate(lumps) if lump[0] == "TEXTMAP"), None)
+        if textmap_idx is None:
+            raise ValueError(f"no TEXTMAP lump found in {wad_path}")
+
+        _, offset, size = lumps[textmap_idx]
+        f.seek(offset)
+        return f.read(size).decode("utf-8", "replace")
+
+
+def _parse_udmf_blocks(text, kind):
+    """Parse simple UDMF blocks like `vertex // 0 { x = ...; }`."""
+    blocks = []
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        header = lines[i].strip().split("//", 1)[0].strip()
+        if header == kind:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and lines[j].strip() == "{":
+                values = {}
+                j += 1
+                while j < len(lines) and lines[j].strip() != "}":
+                    match = re.match(r"\s*(\w+)\s*=\s*(.*?)\s*;\s*$", lines[j])
+                    if match:
+                        key, raw = match.groups()
+                        raw = raw.strip().strip('"')
+                        if raw.lower() in {"true", "false"}:
+                            values[key] = raw.lower() == "true"
+                        else:
+                            try:
+                                values[key] = int(raw)
+                            except ValueError:
+                                try:
+                                    values[key] = float(raw)
+                                except ValueError:
+                                    values[key] = raw
+                    j += 1
+                blocks.append(values)
+                i = j
+        i += 1
+    return blocks
+
+
+def load_wad_map_lines(wad_path, doom_map="map01"):
+    """Return top-down WAD line segments in the same coordinate system as VizDoom POSITION_X/Y."""
+    text = _read_wad_textmap(wad_path, doom_map)
+    vertices = _parse_udmf_blocks(text, "vertex")
+    linedefs = _parse_udmf_blocks(text, "linedef")
+    lines = []
+    for linedef in linedefs:
+        v1, v2 = linedef.get("v1"), linedef.get("v2")
+        if not isinstance(v1, int) or not isinstance(v2, int) or v1 >= len(vertices) or v2 >= len(vertices):
+            continue
+        a, b = vertices[v1], vertices[v2]
+        if "x" not in a or "y" not in a or "x" not in b or "y" not in b:
+            continue
+        lines.append((float(a["x"]), float(a["y"]), float(b["x"]), float(b["y"]), bool(linedef.get("blocking", False))))
+    return lines
+
+
+def _map_extent(map_lines, xs=None, ys=None, pad_frac=0.04):
+    x_vals, y_vals = [], []
+    if map_lines:
+        x_vals.append(np.asarray([[line[0], line[2]] for line in map_lines], dtype=np.float32).reshape(-1))
+        y_vals.append(np.asarray([[line[1], line[3]] for line in map_lines], dtype=np.float32).reshape(-1))
+    if xs is not None and len(xs):
+        x_vals.append(np.asarray(xs, dtype=np.float32).reshape(-1))
+    if ys is not None and len(ys):
+        y_vals.append(np.asarray(ys, dtype=np.float32).reshape(-1))
+    if not x_vals or not y_vals:
+        return None
+    all_x, all_y = np.concatenate(x_vals), np.concatenate(y_vals)
+    x_pad = max(1.0, pad_frac * float(all_x.max() - all_x.min()))
+    y_pad = max(1.0, pad_frac * float(all_y.max() - all_y.min()))
+    return [float(all_x.min() - x_pad), float(all_x.max() + x_pad), float(all_y.min() - y_pad), float(all_y.max() + y_pad)]
+
+
+def _plot_map_lines(ax, map_lines, alpha=0.45, zorder=4):
+    for blocking in (False, True):
+        for x1, y1, x2, y2, is_blocking in map_lines:
+            if is_blocking != blocking:
+                continue
+            ax.plot(
+                [x1, x2],
+                [y1, y2],
+                color="0.20" if blocking else "0.55",
+                linewidth=1.0 if blocking else 0.6,
+                alpha=alpha if blocking else alpha * 0.65,
+                zorder=zorder,
+            )
+
+
+def collect_holdout_transitions(args, seed, size, p_forward=0.55, max_tics=100000):
+    """Forward-biased random walk through the DETERMINISTIC (no-noise) maze, collecting
+    (obs_stack, action, next_frame) transitions plus the (x, y) where each was sampled.
+
+    Forward-bias + a long episode (raised timeout) spread coverage across the maze, instead of
+    canceling out near the spawn the way a uniform turn-left/right/forward walk does. Action order
+    is [TURN_LEFT, TURN_RIGHT, MOVE_FORWARD], so MOVE_FORWARD is the last index."""
+    import dataclasses
+
+    plain = dataclasses.replace(args, noisy_tv=False, episode_timeout=max_tics)
+    env = make_env(plain, idx=0, seed=seed)()
+    n = int(env.action_space.n)
+    forward = n - 1
+    rng = np.random.default_rng(seed)
+    obs, info = env.reset(seed=seed)
+    obs_l, act_l, nxt_l, xs, ys = [], [], [], [], []
+    while len(obs_l) < size:
+        a = forward if rng.random() < p_forward else int(rng.integers(0, n - 1))
+        obs_l.append(np.asarray(obs).copy())
+        nobs, _, term, trunc, info = env.step(a)
+        nobs = np.asarray(nobs)
+        act_l.append(a)
+        nxt_l.append(nobs[-1].copy())
+        xs.append(float(info.get("position_x", 0.0)))
+        ys.append(float(info.get("position_y", 0.0)))
+        obs = nobs
+        if term or trunc:
+            obs, info = env.reset()
+    env.close()
+    return (
+        np.asarray(obs_l, dtype=np.uint8),
+        np.asarray(act_l, dtype=np.int64),
+        np.asarray(nxt_l, dtype=np.uint8),
+        np.asarray(xs, dtype=np.float32),
+        np.asarray(ys, dtype=np.float32),
+    )
+
+
+def collect_or_load_holdout(args):
+    """Load the cached per-seed held-out set (built by build_holdout.py) or collect it inline.
+    Cached per seed+scenario so all methods of a given seed are scored on identical transitions."""
+    os.makedirs(args.holdout_dir, exist_ok=True)
+    path = os.path.join(args.holdout_dir, f"holdout_{args.scenario}_seed{args.seed}.npz")
+    if os.path.isfile(path):
+        d = np.load(path)
+        return d["obs"], d["act"], d["next_frame"]
+    print(
+        f"[holdout] {path} not found -> collecting inline. For deliberate 3-seed coverage + "
+        f"coverage heatmaps, run: python cleanrl/build_holdout.py --scenario {args.scenario}"
+    )
+    obs, act, nxt, xs, ys = collect_holdout_transitions(args, args.seed, args.holdout_size)
+    np.savez_compressed(path, obs=obs, act=act, next_frame=nxt, x=xs, y=ys)
+    return obs, act, nxt
+
+
+@torch.no_grad()
+def eval_wm_holdout(world_model, holdout, obs_rms, num_actions, device, batch=256):
+    """Mean raw-pixel L2 WM error on the held-out deterministic set. Predictions are de-normalized
+    with the run's own obs_rms, so the metric lives in a common raw-pixel space comparable across
+    methods regardless of their observation normalization."""
+    obs_arr, act_arr, next_arr = holdout
+    mean_t = torch.from_numpy(obs_rms.mean).to(device).float()
+    std_t = torch.sqrt(torch.from_numpy(obs_rms.var).to(device)).float()
+    total, n = 0.0, 0
+    for i in range(0, len(obs_arr), batch):
+        obs_b = torch.from_numpy(obs_arr[i : i + batch]).float().to(device)
+        act_b = torch.from_numpy(act_arr[i : i + batch]).long().to(device)
+        nxt_b = torch.from_numpy(next_arr[i : i + batch]).float().to(device).unsqueeze(1)
+        obs_norm = ((obs_b - mean_t) / std_t).clip(-5, 5)
+        ah = F.one_hot(act_b, num_classes=num_actions).float()
+        pred_raw = world_model(obs_norm, ah) * std_t + mean_t
+        err = (pred_raw - nxt_b).flatten(1).pow(2).sum(1).sqrt()
+        total += err.sum().item()
+        n += err.numel()
+    return total / max(n, 1)
+
+
+def save_full_checkpoint(
+    path, args, global_step, update, agent, world_model, neural_critic, rnd_model, obs_rms, reward_rms, world_model_prev=None
+):
+    ckpt = {
+        "args": vars(args),
+        "global_step": global_step,
+        "update": update,
+        "policy_model": _cpu_state_dict(agent),
+        "world_model": _cpu_state_dict(world_model),
+        "obs_rms_mean": obs_rms.mean,
+        "obs_rms_var": obs_rms.var,
+        "reward_rms_mean": reward_rms.mean,
+        "reward_rms_var": reward_rms.var,
+    }
+    if neural_critic is not None:
+        ckpt["neural_critic"] = _cpu_state_dict(neural_critic)
+    if rnd_model is not None:
+        ckpt["rnd_predictor"] = _cpu_state_dict(rnd_model.predictor)
+        ckpt["rnd_target"] = _cpu_state_dict(rnd_model.target)
+    if world_model_prev is not None:  # c_v2's previous-iteration WM snapshot
+        ckpt["world_model_prev"] = _cpu_state_dict(world_model_prev)
+    torch.save(ckpt, path)
+
+
+def run_post_training_plots(run_dir, args):
+    """Generate quick per-run plots from this run's metrics.jsonl.
+
+    The aggregate paper plots still come from `plot_vizdoom_curiosity.py --runs-dir runs`.
+    This hook is intentionally single-run and cheap, so every completed job leaves
+    immediate curves next to its raw metrics.
+    """
+    if not args.post_plot:
+        return
+    try:
+        from plot_vizdoom_curiosity import DEFAULT_METRICS, load_runs, plot_metric_groups, write_summary
+
+        out_dir = args.post_plot_dir or os.path.join(run_dir, "plots")
+        os.makedirs(out_dir, exist_ok=True)
+        run_dir_abs = os.path.abspath(run_dir)
+        runs = [run for run in load_runs(os.path.dirname(run_dir_abs)) if os.path.abspath(run["run_dir"]) == run_dir_abs]
+        if not runs:
+            print(f"[plot] skipped: no run_meta.json + metrics.jsonl found for {run_dir}")
+            return
+        rng = np.random.default_rng(0)
+        made = []
+        for metric in DEFAULT_METRICS:
+            made.extend(plot_metric_groups(runs, metric, out_dir, points=200, n_boot=0, rng=rng))
+        summary_path = os.path.join(out_dir, "summary_final_metrics.csv")
+        rows = write_summary(runs, DEFAULT_METRICS, summary_path, n_boot=0, rng=rng)
+        print(f"[plot] wrote {len(made)} per-run plot(s) + {summary_path} ({len(rows)} rows)")
+    except Exception as exc:  # pragma: no cover
+        print(f"[plot] skipped post-training plots: {exc}")
+
+
 # ----------------------------------------------------------------------------- #
 #  Visualization helpers (best-effort; never crash training)
 # ----------------------------------------------------------------------------- #
@@ -609,7 +918,7 @@ def save_wm_panel(path, obs_last, pred_next, true_next, critic_value=None):
         return None
 
 
-def save_heatmaps(path, xs, ys, intr, in_tv, bins=40):
+def save_heatmaps(path, xs, ys, intr, in_tv, bins=40, map_lines=None):
     try:
         import matplotlib
 
@@ -619,16 +928,44 @@ def save_heatmaps(path, xs, ys, intr, in_tv, bins=40):
         xs, ys, intr = np.asarray(xs), np.asarray(ys), np.asarray(intr)
         if xs.size == 0:
             return None
-        visit, xe, ye = np.histogram2d(xs, ys, bins=bins)
+        map_lines = map_lines or []
+        extent = _map_extent(map_lines, xs, ys)
+        hist_range = [[extent[0], extent[1]], [extent[2], extent[3]]] if extent is not None else None
+        visit, xe, ye = np.histogram2d(xs, ys, bins=bins, range=hist_range)
         rsum, _, _ = np.histogram2d(xs, ys, bins=[xe, ye], weights=intr)
         with np.errstate(invalid="ignore", divide="ignore"):
             rmean = np.where(visit > 0, rsum / visit, 0.0)
-        fig, axes = plt.subplots(1, 2, figsize=(9, 4))
-        for ax, data, title in ((axes[0], visit.T, "visitation"), (axes[1], rmean.T, "mean intrinsic reward")):
-            im = ax.imshow(data, origin="lower", aspect="auto", cmap="viridis")
+        fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))
+        img_extent = [xe[0], xe[-1], ye[0], ye[-1]]
+        cmap_visit = plt.cm.viridis.copy()
+        cmap_visit.set_bad(alpha=0.0)
+        panels = (
+            (axes[0], np.ma.masked_where(visit.T == 0, visit.T), "visitation"),
+            (axes[1], np.ma.masked_where(visit.T == 0, rmean.T), "mean intrinsic reward"),
+        )
+        for ax, data, title in panels:
+            ax.set_facecolor("#f7f7f4")
+            if map_lines:
+                _plot_map_lines(ax, map_lines, alpha=0.28, zorder=1)
+            im = ax.imshow(
+                data,
+                origin="lower",
+                aspect="equal",
+                cmap=cmap_visit,
+                extent=img_extent,
+                interpolation="nearest",
+                alpha=0.78 if map_lines else 1.0,
+                zorder=2,
+            )
+            if map_lines:
+                ax.scatter(xs, ys, s=1.3, c="black", alpha=0.16, linewidths=0, zorder=3)
+                _plot_map_lines(ax, map_lines, alpha=0.45, zorder=4)
             ax.set_title(title, fontsize=10)
             ax.set_xlabel("x")
             ax.set_ylabel("y")
+            ax.set_xlim(img_extent[0], img_extent[1])
+            ax.set_ylim(img_extent[2], img_extent[3])
+            ax.set_aspect("equal", adjustable="box")
             fig.colorbar(im, ax=ax, fraction=0.046)
         frac = float(np.mean(in_tv)) if len(in_tv) else 0.0
         fig.suptitle(f"TV-zone time fraction = {frac:.3f}", fontsize=10)
@@ -641,8 +978,102 @@ def save_heatmaps(path, xs, ys, intr, in_tv, bins=40):
         return None
 
 
+def _map_canvas_transform(extent, width, height):
+    """World-coordinate to image-pixel transform with y-up map coordinates."""
+    x_min, x_max, y_min, y_max = extent
+    left, right, top, bottom = 72, width - 28, 44, height - 58
+    plot_w, plot_h = right - left, bottom - top
+    scale = min(plot_w / max(x_max - x_min, 1e-6), plot_h / max(y_max - y_min, 1e-6))
+    used_w, used_h = (x_max - x_min) * scale, (y_max - y_min) * scale
+    x0 = left + 0.5 * (plot_w - used_w)
+    y0 = top + 0.5 * (plot_h - used_h)
+
+    def to_px(x, y):
+        px = x0 + (float(x) - x_min) * scale
+        py = y0 + used_h - (float(y) - y_min) * scale
+        return int(round(px)), int(round(py))
+
+    return to_px, (int(round(x0)), int(round(y0)), int(round(used_w)), int(round(used_h)))
+
+
+def save_map_video(path, map_lines, xs, ys, in_tv=None, fps=30, width=960, height=720):
+    """Render a top-down trajectory video on the fixed WAD map.
+
+    The transform intentionally matches the static heatmap convention: Doom x grows
+    right, Doom y grows upward, while image pixels grow downward. Positions and WAD
+    line vertices are both transformed by the same function to avoid orientation
+    drift between overlays and videos.
+    """
+    try:
+        import cv2
+
+        xs = np.asarray(xs, dtype=np.float32)
+        ys = np.asarray(ys, dtype=np.float32)
+        if xs.size == 0 or ys.size == 0 or not map_lines:
+            return None
+        valid = np.isfinite(xs) & np.isfinite(ys)
+        xs, ys = xs[valid], ys[valid]
+        if in_tv is not None and len(in_tv):
+            in_tv = np.asarray(in_tv, dtype=bool)[valid]
+        else:
+            in_tv = np.zeros(len(xs), dtype=bool)
+        if xs.size == 0:
+            return None
+
+        extent = _map_extent(map_lines, xs, ys)
+        to_px, (plot_x, plot_y, plot_w, plot_h) = _map_canvas_transform(extent, width, height)
+        base = np.full((height, width, 3), 250, dtype=np.uint8)
+        cv2.rectangle(base, (plot_x, plot_y), (plot_x + plot_w, plot_y + plot_h), (225, 225, 225), 1)
+        cv2.putText(base, "top-down agent trajectory", (24, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (35, 35, 35), 2)
+        cv2.putText(base, "x", (width - 45, height - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+        cv2.putText(base, "y", (24, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 80, 80), 1)
+
+        for blocking in (False, True):
+            color = (150, 150, 150) if not blocking else (45, 45, 45)
+            thickness = 1 if not blocking else 2
+            for x1, y1, x2, y2, is_blocking in map_lines:
+                if bool(is_blocking) != blocking:
+                    continue
+                cv2.line(base, to_px(x1, y1), to_px(x2, y2), color, thickness, lineType=cv2.LINE_AA)
+
+        writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+        if not writer.isOpened():
+            print("[viz] map video skipped: cv2.VideoWriter failed to open (mp4v codec unavailable)")
+            return None
+
+        pts = [to_px(x, y) for x, y in zip(xs, ys)]
+        for i, pt in enumerate(pts):
+            frame = base.copy()
+            if i >= 1:
+                trail = np.asarray(pts[: i + 1], dtype=np.int32).reshape((-1, 1, 2))
+                overlay = frame.copy()
+                cv2.polylines(overlay, [trail], False, (210, 105, 30), 3, lineType=cv2.LINE_AA)
+                frame = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
+            color = (0, 150, 255) if in_tv[i] else (40, 70, 230)
+            cv2.circle(frame, pt, 8, color, -1, lineType=cv2.LINE_AA)
+            cv2.circle(frame, pt, 9, (20, 20, 20), 1, lineType=cv2.LINE_AA)
+            cv2.putText(
+                frame,
+                f"step {i + 1}/{len(pts)}   x={xs[i]:.0f} y={ys[i]:.0f}",
+                (24, height - 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (35, 35, 35),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+            if in_tv[i]:
+                cv2.putText(frame, "TV zone", (width - 112, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 120, 220), 2)
+            writer.write(frame)
+        writer.release()
+        return path
+    except Exception as exc:  # pragma: no cover
+        print(f"[viz] map video skipped: {exc}")
+        return None
+
+
 @torch.no_grad()
-def capture_video(path, args, agent, device, seed):
+def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None):
     """Roll out the current policy in a fresh single env and write an mp4 via OpenCV.
 
     Uses cv2.VideoWriter (cv2 is already a hard dependency) instead of imageio to
@@ -652,26 +1083,48 @@ def capture_video(path, args, agent, device, seed):
         import cv2
 
         env = make_env(args, idx=0, seed=seed + 999, expose_rgb=True)()
+        rng = np.random.default_rng(seed + 999)
         obs, _ = env.reset()
-        frames = []
+        rgb_frames, obs_frames, xs, ys, in_tv = [], [], [], [], []
         for _ in range(args.video_steps):
-            obs_t = torch.tensor(np.asarray(obs), dtype=torch.float32, device=device).unsqueeze(0)
-            action, _, _, _, _ = agent.get_action_and_value(obs_t)
-            obs, _, term, trunc, info = env.step(int(action.item()))
-            frames.append(np.asarray(info.get("rgb")))
+            obs_arr = np.asarray(obs)
+            obs_frames.append(obs_arr[-1].copy())  # newest grayscale frame = exactly what the policy sees (real noise)
+            if args.method == "random":
+                action_i = int(rng.integers(0, int(env.action_space.n)))
+            else:
+                obs_t = torch.tensor(obs_arr, dtype=torch.float32, device=device).unsqueeze(0)
+                action, _, _, _, _ = agent.get_action_and_value(obs_t)
+                action_i = int(action.item())
+            obs, _, term, trunc, info = env.step(action_i)
+            rgb_frames.append(np.asarray(info.get("rgb")))
+            xs.append(float(info.get("position_x", np.nan)))
+            ys.append(float(info.get("position_y", np.nan)))
+            in_tv.append(bool(info.get("in_tv_zone", False)))
             if term or trunc:
                 obs, _ = env.reset()
         env.close()
-        if not frames:
+        if not rgb_frames:
             return None
-        height, width = frames[0].shape[:2]
+        height, width = rgb_frames[0].shape[:2]
         writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (width, height))
         if not writer.isOpened():
             print("[viz] video skipped: cv2.VideoWriter failed to open (mp4v codec unavailable)")
             return None
-        for frame in frames:
+        for frame in rgb_frames:
             writer.write(cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2BGR))
         writer.release()
+        # Also write the agent's exact observation (grayscale, nearest-neighbor upscaled, real noise included).
+        obs_path = os.path.splitext(path)[0] + "_obs.mp4"
+        s = 4
+        ow, oh = 84 * s, 84 * s
+        obs_writer = cv2.VideoWriter(obs_path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (ow, oh))
+        if obs_writer.isOpened():
+            for frame in obs_frames:
+                up = cv2.resize(np.asarray(frame, dtype=np.uint8), (ow, oh), interpolation=cv2.INTER_NEAREST)
+                obs_writer.write(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR))
+            obs_writer.release()
+        if map_path is not None and map_lines:
+            save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, fps=30)
         return path
     except Exception as exc:  # pragma: no cover
         print(f"[viz] video skipped: {exc}")
@@ -850,12 +1303,16 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False,
             config=vars(args),
             name=run_name,
             monitor_gym=False,
             save_code=True,
         )
+        # Make W&B charts use true environment interactions on the x-axis. Relying
+        # on TensorBoard sync can leave the UI showing W&B's internal logging step.
+        wandb.define_metric("global_step")
+        wandb.define_metric("*", step_metric="global_step")
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -863,9 +1320,19 @@ if __name__ == "__main__":
     )
     viz_dir = f"runs/{run_name}/viz"
     video_dir = f"runs/{run_name}/videos"
+    map_video_dir = f"runs/{run_name}/map_vids"
     os.makedirs(viz_dir, exist_ok=True)
     if args.capture_video:
         os.makedirs(video_dir, exist_ok=True)
+        os.makedirs(map_video_dir, exist_ok=True)
+    viz_map_lines = []
+    if args.heatmap_every or args.capture_video:
+        wad_path = os.path.join(args.wad_dir, SCENARIO_WADS[args.scenario])
+        try:
+            viz_map_lines = load_wad_map_lines(wad_path, args.doom_map)
+            print(f"[viz] loaded {len(viz_map_lines)} WAD map lines for heatmap/map-video overlays")
+        except Exception as exc:
+            print(f"[viz] maze overlay unavailable: {exc}")
 
     # seeding
     random.seed(args.seed)
@@ -883,16 +1350,19 @@ if __name__ == "__main__":
     obs_shape = envs.single_observation_space.shape  # (4, 84, 84)
 
     agent = Agent(num_actions).to(device)
-    world_model = ForwardCNN(num_actions=num_actions).to(device) if uses_wm else None
+    # A world model is trained for EVERY method (identical architecture + training) so WM accuracy is
+    # comparable across methods. For cc/c_v1/c_v2 it also produces the intrinsic reward; for
+    # rnd/ppo/random it is a passive evaluation WM (trained on collected data, never feeds the reward).
+    world_model = ForwardCNN(num_actions=num_actions).to(device)
     world_model_prev = ForwardCNN(num_actions=num_actions).to(device) if args.method == "c_v2" else None
     neural_critic = CuriosityCriticCNN(num_actions=num_actions).to(device) if uses_critic else None
     rnd_model = RNDModel().to(device) if uses_rnd else None
     if world_model_prev is not None:
         world_model_prev.load_state_dict(world_model.state_dict())
 
-    combined_parameters = list(agent.parameters())
-    if uses_wm:
-        combined_parameters += list(world_model.parameters())
+    combined_parameters = list(world_model.parameters())  # WM is always trained
+    if not is_random:
+        combined_parameters += list(agent.parameters())  # random has no learned policy
     if uses_rnd:
         combined_parameters += list(rnd_model.predictor.parameters())
     optimizer = optim.Adam(combined_parameters, lr=args.learning_rate, eps=1e-5)
@@ -915,6 +1385,7 @@ if __name__ == "__main__":
     int_values = torch.zeros((args.num_steps, args.num_envs)).to(device)
     next_frames = torch.zeros((args.num_steps, args.num_envs, 84, 84)).to(device)
     avg_returns = deque(maxlen=20)
+    recent_goal_successes = deque(maxlen=100)
 
     global_step = 0
     start_time = time.time()
@@ -939,6 +1410,27 @@ if __name__ == "__main__":
         next_obs, _ = envs.reset()
         next_obs = torch.Tensor(np.asarray(next_obs)).to(device)
 
+    # Held-out deterministic transitions for the WM-accuracy eval (cached per seed; identical across methods).
+    print("Preparing held-out WM-eval set...")
+    holdout = collect_or_load_holdout(args)
+    ckpt_dir = f"runs/{run_name}/checkpoints"
+    if args.ckpt_every:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    metrics_file = open(f"runs/{run_name}/metrics.jsonl", "a")
+    with open(f"runs/{run_name}/run_meta.json", "w") as _meta:
+        json.dump(
+            {
+                "args": vars(args),
+                "git_commit": _git_commit(),
+                "num_actions": num_actions,
+                "device": str(device),
+                "created": time.time(),
+            },
+            _meta,
+            indent=2,
+        )
+    last_ep = {"avg": float("nan"), "ret": float("nan"), "len": float("nan")}  # latest episodic stats (for per-update plots)
+
     def log_episode_infos(infos, curiosity_step_mean):
         # gymnasium 1.x: infos["episode"] (dict of arrays) + "_episode" mask
         # gymnasium 0.29: infos["final_info"] (array of per-env dicts/None), episode r/l are arrays
@@ -960,10 +1452,20 @@ if __name__ == "__main__":
                     )
         for r, length in pairs:
             avg_returns.append(r)
-            writer.add_scalar("charts/avg_episodic_return", float(np.mean(avg_returns)), global_step)
+            last_ep["avg"], last_ep["ret"], last_ep["len"] = float(np.mean(avg_returns)), r, length
+            episode_row = {
+                "global_step": global_step,
+                "charts/avg_episodic_return": float(np.mean(avg_returns)),
+                "charts/episodic_return": r,
+                "charts/episodic_length": length,
+                "charts/episode_curiosity_reward": curiosity_step_mean,
+            }
+            writer.add_scalar("charts/avg_episodic_return", episode_row["charts/avg_episodic_return"], global_step)
             writer.add_scalar("charts/episodic_return", r, global_step)
             writer.add_scalar("charts/episodic_length", length, global_step)
             writer.add_scalar("charts/episode_curiosity_reward", curiosity_step_mean, global_step)
+            if args.track:
+                wandb.log(episode_row)
             print(f"global_step={global_step}, episodic_return={r:.3f}")
 
     for update in range(1, args.num_iterations + 1):
@@ -976,6 +1478,12 @@ if __name__ == "__main__":
         rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
         ep_xs, ep_ys, ep_intr, ep_tv = [], [], [], []
+        goal_hits_update = 0
+        episode_ends_update = 0
+        tt = {}  # per-update timing accumulators (seconds)
+        if args.profile_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        _t_rollout0 = time.perf_counter()
 
         for step in range(0, args.num_steps):
             global_step += args.num_envs
@@ -994,12 +1502,19 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             next_obs_np, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
+            reward_np = np.asarray(reward, dtype=np.float32).reshape(-1)
             done = np.logical_or(terminated, truncated)
             next_obs_np = np.asarray(next_obs_np)
-            rewards[step] = torch.tensor(np.asarray(reward), dtype=torch.float32, device=device).view(-1)
+            rewards[step] = torch.tensor(reward_np, dtype=torch.float32, device=device).view(-1)
             next_obs = torch.Tensor(next_obs_np).to(device)
             next_done = torch.Tensor(done.astype(np.float32)).to(device)
             next_frames[step] = next_obs[:, 3, :, :]
+            goal_mask = reward_np > 0.0
+            goal_hits_update += int(goal_mask.sum())
+            episode_ends_update += int(np.asarray(done).sum())
+            for hit, ended in zip(goal_mask, np.asarray(done, dtype=bool)):
+                if ended:
+                    recent_goal_successes.append(bool(hit))
 
             # intrinsic reward with frozen auxiliary models (RND timing)
             if use_intrinsic:
@@ -1010,7 +1525,8 @@ if __name__ == "__main__":
                 action_onehot = F.one_hot(action.long(), num_classes=num_actions).float()
                 with torch.no_grad():
                     if args.method == "rnd":
-                        pred_f, targ_f = rnd_model(target_next)
+                        with _Timer(tt, "reward_aux", args.profile_timing, device):
+                            pred_f, targ_f = rnd_model(target_next)
                         intr = (targ_f - pred_f).pow(2).sum(1) / 2
                     else:
                         wm_pred = world_model(obs_norm, action_onehot)
@@ -1022,7 +1538,8 @@ if __name__ == "__main__":
                             err_prev = _reward_error_per_sample(wm_pred_prev, target_next)
                             intr = (err_prev - err_before).clamp(min=0)
                         else:  # cc
-                            critic_pred = neural_critic(obs_norm, action_onehot).squeeze(-1).clamp(min=0)
+                            with _Timer(tt, "reward_aux", args.profile_timing, device):
+                                critic_pred = neural_critic(obs_norm, action_onehot).squeeze(-1).clamp(min=0)
                             intr = (err_before - critic_pred).clamp(min=0)
                     curiosity_rewards[step] = intr.detach()
 
@@ -1037,14 +1554,9 @@ if __name__ == "__main__":
 
             log_episode_infos(infos, float(curiosity_rewards[step].mean().item()))
 
-        # ---- random baseline: no learning, just logging ----
-        if is_random:
-            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-            if args.heatmap_every and update % args.heatmap_every == 0:
-                p = save_heatmaps(f"{viz_dir}/heatmap_update{update:06d}.png", ep_xs, ep_ys, ep_intr, ep_tv)
-                if p and args.track:
-                    wandb.log({"viz/heatmap": wandb.Image(p)}, step=global_step)
-            continue
+        if args.profile_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        tt["rollout"] = time.perf_counter() - _t_rollout0
 
         # ---- normalize intrinsic rewards ----
         if use_intrinsic:
@@ -1059,46 +1571,48 @@ if __name__ == "__main__":
             reward_rms.update_from_moments(mean, std**2, count)
             curiosity_rewards /= np.sqrt(reward_rms.var)
 
-        # ---- GAE ----
-        with torch.no_grad():
-            next_value_ext, next_value_int = agent.get_value(next_obs)
-            next_value_ext, next_value_int = next_value_ext.reshape(1, -1), next_value_int.reshape(1, -1)
-            ext_advantages = torch.zeros_like(rewards, device=device)
-            int_advantages = torch.zeros_like(curiosity_rewards, device=device)
-            ext_lastgaelam = 0
-            int_lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    ext_nextnonterminal = 1.0 - next_done
-                    ext_nextvalues = next_value_ext
-                    int_nextvalues = next_value_int
-                else:
-                    ext_nextnonterminal = 1.0 - dones[t + 1]
-                    ext_nextvalues = ext_values[t + 1]
-                    int_nextvalues = int_values[t + 1]
-                int_nextnonterminal = 1.0
-                ext_delta = rewards[t] + args.gamma * ext_nextvalues * ext_nextnonterminal - ext_values[t]
-                int_delta = curiosity_rewards[t] + args.int_gamma * int_nextvalues * int_nextnonterminal - int_values[t]
-                ext_advantages[t] = ext_lastgaelam = (
-                    ext_delta + args.gamma * args.gae_lambda * ext_nextnonterminal * ext_lastgaelam
-                )
-                int_advantages[t] = int_lastgaelam = (
-                    int_delta + args.int_gamma * args.gae_lambda * int_nextnonterminal * int_lastgaelam
-                )
-            ext_returns = ext_advantages + ext_values
-            int_returns = int_advantages + int_values
+        # ---- GAE (policy methods only) ----
+        if not is_random:
+            with torch.no_grad():
+                next_value_ext, next_value_int = agent.get_value(next_obs)
+                next_value_ext, next_value_int = next_value_ext.reshape(1, -1), next_value_int.reshape(1, -1)
+                ext_advantages = torch.zeros_like(rewards, device=device)
+                int_advantages = torch.zeros_like(curiosity_rewards, device=device)
+                ext_lastgaelam = 0
+                int_lastgaelam = 0
+                for t in reversed(range(args.num_steps)):
+                    if t == args.num_steps - 1:
+                        ext_nextnonterminal = 1.0 - next_done
+                        ext_nextvalues = next_value_ext
+                        int_nextvalues = next_value_int
+                    else:
+                        ext_nextnonterminal = 1.0 - dones[t + 1]
+                        ext_nextvalues = ext_values[t + 1]
+                        int_nextvalues = int_values[t + 1]
+                    int_nextnonterminal = 1.0
+                    ext_delta = rewards[t] + args.gamma * ext_nextvalues * ext_nextnonterminal - ext_values[t]
+                    int_delta = curiosity_rewards[t] + args.int_gamma * int_nextvalues * int_nextnonterminal - int_values[t]
+                    ext_advantages[t] = ext_lastgaelam = (
+                        ext_delta + args.gamma * args.gae_lambda * ext_nextnonterminal * ext_lastgaelam
+                    )
+                    int_advantages[t] = int_lastgaelam = (
+                        int_delta + args.int_gamma * args.gae_lambda * int_nextnonterminal * int_lastgaelam
+                    )
+                ext_returns = ext_advantages + ext_values
+                int_returns = int_advantages + int_values
 
         # ---- flatten ----
         b_obs = obs.reshape((-1,) + obs_shape)
-        b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape(-1)
-        b_ext_advantages = ext_advantages.reshape(-1)
-        b_int_advantages = int_advantages.reshape(-1)
-        b_ext_returns = ext_returns.reshape(-1)
-        b_int_returns = int_returns.reshape(-1)
-        b_ext_values = ext_values.reshape(-1)
         b_next_frames = next_frames.reshape(-1, 84, 84)
-        b_advantages = b_int_advantages * int_coef + b_ext_advantages * args.ext_coef
+        if not is_random:
+            b_logprobs = logprobs.reshape(-1)
+            b_ext_advantages = ext_advantages.reshape(-1)
+            b_int_advantages = int_advantages.reshape(-1)
+            b_ext_returns = ext_returns.reshape(-1)
+            b_int_returns = int_returns.reshape(-1)
+            b_ext_values = ext_values.reshape(-1)
+            b_advantages = b_int_advantages * int_coef + b_ext_advantages * args.ext_coef
 
         obs_rms.update(b_obs[:, 3, :, :].reshape(-1, 1, 84, 84).cpu().numpy())
         update_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
@@ -1111,9 +1625,14 @@ if __name__ == "__main__":
         # ---- optimize ----
         b_inds = np.arange(args.batch_size)
         clipfracs = []
-        critic_loss_sum = err_before_sum = err_after_sum = critic_pred_sum = fwd_loss_log = 0.0
+        critic_loss_sum = err_before_sum = err_after_sum = critic_pred_sum = 0.0
+        wm_loss_sum = fwd_loss_log = 0.0
+        v_loss = pg_loss = entropy_loss = approx_kl = old_approx_kl = torch.tensor(0.0, device=device)
         n_mb = 0
         last_panel = None  # (obs_last, pred, true, critic_value) for WM viz
+        if args.profile_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        _t_update0 = time.perf_counter()
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
             for start in range(0, args.batch_size, args.minibatch_size):
@@ -1121,58 +1640,66 @@ if __name__ == "__main__":
                 mb_inds = b_inds[start:end]
                 mb_actions_long = b_actions.long()[mb_inds]
 
-                forward_loss = torch.tensor(0.0, device=device)
-                if uses_wm or uses_rnd:
-                    mb_obs_norm = _normalize_stack(b_obs[mb_inds], update_obs_mean, update_obs_std)
-                    mb_target = _normalize_stack(
-                        b_next_frames[mb_inds].reshape(-1, 1, 84, 84), update_obs_mean, update_obs_std
-                    )
-                    mb_actions_onehot = F.one_hot(mb_actions_long, num_classes=num_actions).float()
-                    mask = (torch.rand(len(mb_inds), device=device) < args.update_proportion).float()
-                    denom = torch.max(mask.sum(), torch.tensor(1.0, device=device))
-                    if uses_rnd:
-                        pred_f, targ_f = rnd_model(mb_target)
-                        fl = F.mse_loss(pred_f, targ_f.detach(), reduction="none").mean(-1)
-                        forward_loss = (fl * mask).sum() / denom
-                    else:
-                        wm_pred = world_model(mb_obs_norm, mb_actions_onehot)
-                        fl = _update_loss_per_sample(wm_pred, mb_target.detach())
-                        forward_loss = (fl * mask).sum() / denom
-                        err_before_sum += _reward_error_per_sample(wm_pred.detach(), mb_target).mean().item()
-                    fwd_loss_log = forward_loss.item()
-
-                _, newlogprob, entropy, new_ext_values, new_int_values = agent.get_action_and_value(
-                    b_obs[mb_inds], mb_actions_long
+                mb_obs_norm = _normalize_stack(b_obs[mb_inds], update_obs_mean, update_obs_std)
+                mb_target = _normalize_stack(
+                    b_next_frames[mb_inds].reshape(-1, 1, 84, 84), update_obs_mean, update_obs_std
                 )
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-                with torch.no_grad():
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                mb_actions_onehot = F.one_hot(mb_actions_long, num_classes=num_actions).float()
+                mask = (torch.rand(len(mb_inds), device=device) < args.update_proportion).float()
+                denom = torch.max(mask.sum(), torch.tensor(1.0, device=device))
 
-                mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+                # world model -- trained for EVERY method (passive for rnd/ppo/random)
+                with _Timer(tt, "wm_update", args.profile_timing, device):
+                    wm_pred = world_model(mb_obs_norm, mb_actions_onehot)
+                    wm_loss = (_update_loss_per_sample(wm_pred, mb_target.detach()) * mask).sum() / denom
+                err_before_sum += _reward_error_per_sample(wm_pred.detach(), mb_target).mean().item()
+                wm_loss_sum += wm_loss.item()
 
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                new_ext_values, new_int_values = new_ext_values.view(-1), new_int_values.view(-1)
-                if args.clip_vloss:
-                    ext_v_loss_unclipped = (new_ext_values - b_ext_returns[mb_inds]) ** 2
-                    ext_v_clipped = b_ext_values[mb_inds] + torch.clamp(
-                        new_ext_values - b_ext_values[mb_inds], -args.clip_coef, args.clip_coef
-                    )
-                    ext_v_loss_clipped = (ext_v_clipped - b_ext_returns[mb_inds]) ** 2
-                    ext_v_loss = 0.5 * torch.max(ext_v_loss_unclipped, ext_v_loss_clipped).mean()
+                # RND predictor (aux) -- trained in the combined loss for rnd only
+                rnd_loss = torch.tensor(0.0, device=device)
+                if uses_rnd:
+                    with _Timer(tt, "aux_update", args.profile_timing, device):
+                        pred_f, targ_f = rnd_model(mb_target)
+                        rnd_loss = (F.mse_loss(pred_f, targ_f.detach(), reduction="none").mean(-1) * mask).sum() / denom
+                    fwd_loss_log = rnd_loss.item()
                 else:
-                    ext_v_loss = 0.5 * ((new_ext_values - b_ext_returns[mb_inds]) ** 2).mean()
-                int_v_loss = 0.5 * ((new_int_values - b_int_returns[mb_inds]) ** 2).mean() if use_intrinsic else 0.0
-                v_loss = ext_v_loss + int_v_loss
-                entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + forward_loss
+                    fwd_loss_log = wm_loss.item()
+
+                if is_random:
+                    loss = wm_loss  # no learned policy; just train the passive world model
+                else:
+                    _, newlogprob, entropy, new_ext_values, new_int_values = agent.get_action_and_value(
+                        b_obs[mb_inds], mb_actions_long
+                    )
+                    logratio = newlogprob - b_logprobs[mb_inds]
+                    ratio = logratio.exp()
+                    with torch.no_grad():
+                        old_approx_kl = (-logratio).mean()
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                    mb_advantages = b_advantages[mb_inds]
+                    if args.norm_adv:
+                        mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
+
+                    pg_loss1 = -mb_advantages * ratio
+                    pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    new_ext_values, new_int_values = new_ext_values.view(-1), new_int_values.view(-1)
+                    if args.clip_vloss:
+                        ext_v_loss_unclipped = (new_ext_values - b_ext_returns[mb_inds]) ** 2
+                        ext_v_clipped = b_ext_values[mb_inds] + torch.clamp(
+                            new_ext_values - b_ext_values[mb_inds], -args.clip_coef, args.clip_coef
+                        )
+                        ext_v_loss_clipped = (ext_v_clipped - b_ext_returns[mb_inds]) ** 2
+                        ext_v_loss = 0.5 * torch.max(ext_v_loss_unclipped, ext_v_loss_clipped).mean()
+                    else:
+                        ext_v_loss = 0.5 * ((new_ext_values - b_ext_returns[mb_inds]) ** 2).mean()
+                    int_v_loss = 0.5 * ((new_int_values - b_int_returns[mb_inds]) ** 2).mean() if use_intrinsic else 0.0
+                    v_loss = ext_v_loss + int_v_loss
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef + wm_loss + rnd_loss
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -1180,29 +1707,27 @@ if __name__ == "__main__":
                     nn.utils.clip_grad_norm_(combined_parameters, args.max_grad_norm)
                 optimizer.step()
 
-                # neural critic regresses the post-WM-update error on the same samples
+                # neural critic (aux) regresses the post-WM-update error on the same samples
                 if uses_critic:
-                    with torch.no_grad():
-                        post_pred = world_model(mb_obs_norm, mb_actions_onehot)
-                        err_after = _reward_error_per_sample(post_pred, mb_target).detach()
-                    critic_pred_train = neural_critic(mb_obs_norm, mb_actions_onehot).squeeze(-1)
-                    critic_loss_per = F.mse_loss(critic_pred_train, err_after, reduction="none")
-                    critic_loss = (critic_loss_per * mask).sum() / denom
-                    critic_optimizer.zero_grad()
-                    critic_loss.backward()
-                    if args.max_grad_norm:
-                        nn.utils.clip_grad_norm_(neural_critic.parameters(), args.max_grad_norm)
-                    critic_optimizer.step()
+                    with _Timer(tt, "aux_update", args.profile_timing, device):
+                        with torch.no_grad():
+                            post_pred = world_model(mb_obs_norm, mb_actions_onehot)
+                            err_after = _reward_error_per_sample(post_pred, mb_target).detach()
+                        critic_pred_train = neural_critic(mb_obs_norm, mb_actions_onehot).squeeze(-1)
+                        critic_loss = (F.mse_loss(critic_pred_train, err_after, reduction="none") * mask).sum() / denom
+                        critic_optimizer.zero_grad()
+                        critic_loss.backward()
+                        if args.max_grad_norm:
+                            nn.utils.clip_grad_norm_(neural_critic.parameters(), args.max_grad_norm)
+                        critic_optimizer.step()
                     critic_loss_sum += critic_loss.item()
                     err_after_sum += err_after.mean().item()
                     critic_pred_sum += critic_pred_train.detach().clamp(min=0).mean().item()
 
-                # stash one minibatch sample for the WM-prediction panel
-                if uses_wm and last_panel is None and args.wm_panel_every and update % args.wm_panel_every == 0:
+                # stash one minibatch sample for the WM-prediction panel (every method trains a WM now)
+                if last_panel is None and args.wm_panel_every and update % args.wm_panel_every == 0:
                     with torch.no_grad():
-                        cv = None
-                        if uses_critic:
-                            cv = float(neural_critic(mb_obs_norm[:1], mb_actions_onehot[:1]).item())
+                        cv = float(neural_critic(mb_obs_norm[:1], mb_actions_onehot[:1]).item()) if uses_critic else None
                         last_panel = (
                             b_obs[mb_inds][0, 3].cpu().numpy(),
                             world_model(mb_obs_norm[:1], mb_actions_onehot[:1])[0, 0].cpu().numpy(),
@@ -1211,66 +1736,146 @@ if __name__ == "__main__":
                         )
                 n_mb += 1
 
-            if args.target_kl is not None and approx_kl > args.target_kl:
+            if args.target_kl is not None and not is_random and approx_kl > args.target_kl:
                 break
+        if args.profile_timing and device.type == "cuda":
+            torch.cuda.synchronize()
+        tt["update"] = time.perf_counter() - _t_update0
 
-        # ---- logging ----
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+        # ---- held-out world-model accuracy (every method trains a WM) ----
+        wm_holdout = float("nan")
+        if args.eval_every and update % args.eval_every == 0:
+            _t_eval0 = time.perf_counter()
+            wm_holdout = eval_wm_holdout(world_model, holdout, obs_rms, num_actions, device)
+            tt["eval"] = time.perf_counter() - _t_eval0
+
+        # ---- scalar logging (mirrored to metrics.jsonl) ----
+        sps = int(global_step / (time.time() - start_time))
+        tt["total"] = tt.get("rollout", 0.0) + tt.get("update", 0.0)
+        tv_arr = np.asarray(ep_tv, dtype=bool)
+        intr_arr = np.asarray(ep_intr, dtype=np.float32)
+        tv_count = int(tv_arr.sum()) if tv_arr.size else 0
+        non_tv_count = int((~tv_arr).sum()) if tv_arr.size else 0
+        row = {
+            "global_step": global_step,
+            "update": update,
+            "charts/learning_rate": optimizer.param_groups[0]["lr"],
+            "charts/SPS": sps,
+            "charts/goal_hits_update": goal_hits_update,
+            "charts/episodes_update": episode_ends_update,
+            "charts/goal_reached_rate_update": goal_hits_update / max(episode_ends_update, 1),
+            "mechanism/tv_zone_fraction": float(tv_arr.mean()) if tv_arr.size else 0.0,
+            "mechanism/intrinsic_tv_mean_raw": float(intr_arr[tv_arr].mean()) if tv_count else 0.0,
+            "mechanism/intrinsic_non_tv_mean_raw": float(intr_arr[~tv_arr].mean()) if non_tv_count else 0.0,
+            "mechanism/tv_sample_count": tv_count,
+            "mechanism/non_tv_sample_count": non_tv_count,
+            "losses/wm_loss": wm_loss_sum / max(n_mb, 1),
+            "losses/error_before": err_before_sum / max(n_mb, 1),
+            "time/rollout_s": tt.get("rollout", 0.0),
+            "time/update_s": tt.get("update", 0.0),
+            "time/total_s": tt.get("total", 0.0),
+            "time/reward_aux_s": tt.get("reward_aux", 0.0),
+            "time/wm_update_s": tt.get("wm_update", 0.0),
+            "time/aux_update_s": tt.get("aux_update", 0.0),
+            "time/aux_total_s": tt.get("reward_aux", 0.0) + tt.get("aux_update", 0.0),
+            "time/eval_s": tt.get("eval", 0.0),
+        }
+        if not is_random:
+            row["losses/value_loss"] = float(v_loss.item())
+            row["losses/policy_loss"] = float(pg_loss.item())
+            row["losses/entropy"] = float(entropy_loss.item())
+            row["losses/approx_kl"] = float(approx_kl.item())
+            row["losses/old_approx_kl"] = float(old_approx_kl.item())
         if use_intrinsic:
-            writer.add_scalar("losses/fwd_loss", fwd_loss_log, global_step)
-            writer.add_scalar("charts/curiosity_reward_mean", float(curiosity_rewards.mean().item()), global_step)
-        if uses_wm:
-            writer.add_scalar("losses/error_before", err_before_sum / max(n_mb, 1), global_step)
+            row["losses/fwd_loss"] = fwd_loss_log
+            row["charts/curiosity_reward_mean"] = float(curiosity_rewards.mean().item())
         if uses_critic:
-            writer.add_scalar("losses/critic_loss", critic_loss_sum / max(n_mb, 1), global_step)
-            writer.add_scalar("losses/error_after", err_after_sum / max(n_mb, 1), global_step)
-            writer.add_scalar("charts/critic_pred_mean", critic_pred_sum / max(n_mb, 1), global_step)
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
+            row["losses/critic_loss"] = critic_loss_sum / max(n_mb, 1)
+            row["losses/error_after"] = err_after_sum / max(n_mb, 1)
+            row["charts/critic_pred_mean"] = critic_pred_sum / max(n_mb, 1)
+        if not np.isnan(wm_holdout):
+            row["eval/wm_holdout_l2"] = wm_holdout
+        # dense per-update episodic plots (new _periodic keys; non-destructive) so methods that solve
+        # rarely still span the full x-axis in wandb instead of looking truncated
+        if not np.isnan(last_ep["avg"]):
+            row["charts/avg_episodic_return_periodic"] = last_ep["avg"]
+            row["charts/episodic_return_periodic"] = last_ep["ret"]
+            row["charts/episodic_length_periodic"] = last_ep["len"]
+        if recent_goal_successes:
+            row["charts/goal_reached_rate_100ep"] = float(np.mean(recent_goal_successes))
+        for key, val in row.items():
+            if key not in ("global_step", "update"):
+                writer.add_scalar(key, val, global_step)
+        if args.track:
+            wandb.log(row)
+        metrics_file.write(json.dumps(row) + "\n")
+        metrics_file.flush()
+        print(f"update={update} SPS={sps} wm_holdout={wm_holdout:.2f}")
+
+        # ---- periodic full checkpoint (so any instant can be reconstructed without rerunning) ----
+        if args.ckpt_every and update % args.ckpt_every == 0:
+            save_full_checkpoint(
+                f"{ckpt_dir}/ckpt_update{update:06d}.cleanrl_model", args, global_step, update,
+                agent, world_model, neural_critic, rnd_model, obs_rms, reward_rms, world_model_prev=world_model_prev,
+            )
 
         # ---- visualization dumps ----
-        if uses_wm and last_panel is not None:
+        if last_panel is not None:
             p = save_wm_panel(f"{viz_dir}/wm_panel_update{update:06d}.png", *last_panel)
             if p and args.track:
-                wandb.log({"viz/wm_panel": wandb.Image(p)}, step=global_step)
+                wandb.log({"global_step": global_step, "viz/wm_panel": wandb.Image(p)})
         if args.heatmap_every and update % args.heatmap_every == 0:
-            p = save_heatmaps(f"{viz_dir}/heatmap_update{update:06d}.png", ep_xs, ep_ys, ep_intr, ep_tv)
+            p = save_heatmaps(
+                f"{viz_dir}/heatmap_update{update:06d}.png",
+                ep_xs,
+                ep_ys,
+                ep_intr,
+                ep_tv,
+                map_lines=viz_map_lines,
+            )
             if p and args.track:
-                wandb.log({"viz/heatmap": wandb.Image(p)}, step=global_step)
+                wandb.log({"global_step": global_step, "viz/heatmap": wandb.Image(p)})
+            # raw position/intrinsic data so any heatmap/coverage analysis can be re-rendered later
+            np.savez_compressed(
+                f"{viz_dir}/positions_update{update:06d}.npz",
+                x=np.asarray(ep_xs, dtype=np.float32),
+                y=np.asarray(ep_ys, dtype=np.float32),
+                intr=np.asarray(ep_intr, dtype=np.float32),
+                in_tv=np.asarray(ep_tv, dtype=np.float32),
+            )
         if args.capture_video and args.video_every and update % args.video_every == 0:
-            p = capture_video(f"{video_dir}/update{update:06d}.mp4", args, agent, device, args.seed)
+            map_video_path = f"{map_video_dir}/update{update:06d}.mp4"
+            p = capture_video(
+                f"{video_dir}/update{update:06d}.mp4",
+                args,
+                agent,
+                device,
+                args.seed,
+                map_path=map_video_path,
+                map_lines=viz_map_lines,
+            )
             if p and args.track:
-                wandb.log({"viz/video": wandb.Video(p)}, step=global_step)
+                wandb.log({"global_step": global_step, "viz/video": wandb.Video(p)})
+                obs_mp4 = os.path.splitext(p)[0] + "_obs.mp4"
+                if os.path.isfile(obs_mp4):
+                    wandb.log({"global_step": global_step, "viz/video_obs": wandb.Video(obs_mp4)})
+                if os.path.isfile(map_video_path):
+                    wandb.log({"global_step": global_step, "viz/map_video": wandb.Video(map_video_path)})
 
-    # ---- save ----
+    # ---- final save ----
     if args.save_model:
-        model_dir = f"runs/{run_name}"
-        checkpoint = {
-            "args": vars(args),
-            "global_step": global_step,
-            "policy_model": _cpu_state_dict(agent),
-            "obs_rms_mean": obs_rms.mean,
-            "obs_rms_var": obs_rms.var,
-            "reward_rms_mean": reward_rms.mean,
-            "reward_rms_var": reward_rms.var,
-        }
-        if uses_wm:
-            checkpoint["world_model"] = _cpu_state_dict(world_model)
-        if uses_critic:
-            checkpoint["neural_critic"] = _cpu_state_dict(neural_critic)
-        if uses_rnd:
-            checkpoint["rnd_predictor"] = _cpu_state_dict(rnd_model.predictor)
-            checkpoint["rnd_target"] = _cpu_state_dict(rnd_model.target)
-        path = f"{model_dir}/{args.exp_name}.cleanrl_model"
-        torch.save(checkpoint, path)
+        path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        save_full_checkpoint(
+            path, args, global_step, args.num_iterations, agent, world_model,
+            neural_critic, rnd_model, obs_rms, reward_rms, world_model_prev=world_model_prev,
+        )
         print(f"model saved to {path}")
         if args.track:
             wandb.save(path)
 
+    metrics_file.close()
     envs.close()
     writer.close()
+    run_post_training_plots(f"runs/{run_name}", args)
+    if args.track:
+        wandb.finish()
