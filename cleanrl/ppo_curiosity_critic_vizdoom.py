@@ -1516,18 +1516,18 @@ if __name__ == "__main__":
         world_model_prev.load_state_dict(world_model.state_dict())
 
     wm_parameters = list(world_model.parameters())  # WM is always trained
-    policy_aux_parameters = []
-    if not is_random:
-        policy_aux_parameters += list(agent.parameters())  # random has no learned policy
-    if uses_rnd:
-        policy_aux_parameters += list(rnd_model.predictor.parameters())
+    policy_parameters = [] if is_random else list(agent.parameters())  # random has no learned policy
+    # Every auxiliary model (WM / critic / RND predictor) gets its OWN Adam + clip group; the
+    # policy never shares its gradient-clip budget with an aux model, identically for all methods.
+    rnd_parameters = list(rnd_model.predictor.parameters()) if uses_rnd else []
     wm_optimizer = optim.Adam(wm_parameters, lr=args.learning_rate, eps=1e-5)
     policy_optimizer = (
-        optim.Adam(policy_aux_parameters, lr=args.learning_rate, eps=1e-5) if policy_aux_parameters else None
+        optim.Adam(policy_parameters, lr=args.learning_rate, eps=1e-5) if policy_parameters else None
     )
     critic_optimizer = (
         optim.Adam(neural_critic.parameters(), lr=args.learning_rate, eps=1e-5) if uses_critic else None
     )
+    rnd_optimizer = optim.Adam(rnd_parameters, lr=args.learning_rate, eps=1e-5) if uses_rnd else None
 
     reward_rms = RunningMeanStd()
     obs_rms = RunningMeanStd(shape=(1, 1, 84, 84))
@@ -1638,6 +1638,8 @@ if __name__ == "__main__":
                 policy_optimizer.param_groups[0]["lr"] = lrnow
             if critic_optimizer is not None:
                 critic_optimizer.param_groups[0]["lr"] = lrnow
+            if rnd_optimizer is not None:
+                rnd_optimizer.param_groups[0]["lr"] = lrnow
 
         rollout_obs_mean = torch.from_numpy(obs_rms.mean).to(device)
         rollout_obs_std = torch.sqrt(torch.from_numpy(obs_rms.var).to(device))
@@ -1875,13 +1877,19 @@ if __name__ == "__main__":
                 wm_optimizer.zero_grad()
                 if policy_optimizer is not None:
                     policy_optimizer.zero_grad()
+                if rnd_optimizer is not None:
+                    rnd_optimizer.zero_grad()
                 loss.backward()
                 if args.max_grad_norm:
                     nn.utils.clip_grad_norm_(wm_parameters, args.max_grad_norm)
-                    if policy_aux_parameters:
-                        nn.utils.clip_grad_norm_(policy_aux_parameters, args.max_grad_norm)
+                    if policy_parameters:
+                        nn.utils.clip_grad_norm_(policy_parameters, args.max_grad_norm)
+                    if rnd_parameters:
+                        nn.utils.clip_grad_norm_(rnd_parameters, args.max_grad_norm)
                 if policy_optimizer is not None:
                     policy_optimizer.step()
+                if rnd_optimizer is not None:
+                    rnd_optimizer.step()
                 wm_optimizer.step()
 
                 # neural critic (aux) regresses the post-WM-update error on the same samples
@@ -1972,6 +1980,8 @@ if __name__ == "__main__":
         if use_intrinsic:
             row["losses/fwd_loss"] = fwd_loss_log
             row["charts/curiosity_reward_mean"] = float(curiosity_rewards.mean().item())
+        if rnd_optimizer is not None:
+            row["charts/rnd_learning_rate"] = rnd_optimizer.param_groups[0]["lr"]
         if uses_critic:
             row["losses/critic_loss"] = critic_loss_sum / max(n_mb, 1)
             row["losses/error_after"] = err_after_sum / max(n_mb, 1)
