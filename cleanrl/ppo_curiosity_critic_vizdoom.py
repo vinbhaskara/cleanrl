@@ -1136,7 +1136,7 @@ def _draw_vest_markers(frame, vest_positions, to_px):
         cv2.putText(frame, "vest", (cx + 14, cy - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, lineType=cv2.LINE_AA)
 
 
-def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, fps=30, width=960, height=720):
+def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, dones=None, fps=30, width=960, height=720):
     """Render a top-down trajectory video on the fixed WAD map.
 
     The transform intentionally matches the static heatmap convention: Doom x grows
@@ -1157,6 +1157,10 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, fps
             in_tv = np.asarray(in_tv, dtype=bool)[valid]
         else:
             in_tv = np.zeros(len(xs), dtype=bool)
+        if dones is not None and len(dones) == valid.shape[0]:
+            dones = np.asarray(dones, dtype=bool)[valid]
+        else:
+            dones = np.zeros(len(xs), dtype=bool)
         if xs.size == 0:
             return None
 
@@ -1183,10 +1187,11 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, fps
             return None
 
         pts = [to_px(x, y) for x, y in zip(xs, ys)]
+        ep_start = 0  # restart the trail at each episode boundary (no vest->respawn line, no stale trail)
         for i, pt in enumerate(pts):
             frame = base.copy()
-            if i >= 1:
-                trail = np.asarray(pts[: i + 1], dtype=np.int32).reshape((-1, 1, 2))
+            if i > ep_start:
+                trail = np.asarray(pts[ep_start : i + 1], dtype=np.int32).reshape((-1, 1, 2))
                 overlay = frame.copy()
                 cv2.polylines(overlay, [trail], False, (210, 105, 30), 3, lineType=cv2.LINE_AA)
                 frame = cv2.addWeighted(overlay, 0.72, frame, 0.28, 0)
@@ -1207,6 +1212,8 @@ def save_map_video(path, map_lines, xs, ys, in_tv=None, vest_positions=None, fps
             if in_tv[i]:
                 cv2.putText(frame, "TV zone", (width - 112, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 120, 220), 2)
             writer.write(frame)
+            if dones[i]:
+                ep_start = i + 1
         writer.release()
         return path
     except Exception as exc:  # pragma: no cover
@@ -1227,7 +1234,7 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
         env = make_env(args, idx=0, seed=seed + 999, expose_rgb=True)()
         rng = np.random.default_rng(seed + 999)
         obs, _ = env.reset()
-        rgb_frames, obs_frames, xs, ys, in_tv = [], [], [], [], []
+        rgb_frames, obs_frames, xs, ys, in_tv, dones = [], [], [], [], [], []
         for _ in range(args.video_steps):
             obs_arr = np.asarray(obs)
             if args.method == "random":
@@ -1242,6 +1249,7 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
             xs.append(float(info.get("position_x", np.nan)))
             ys.append(float(info.get("position_y", np.nan)))
             in_tv.append(bool(info.get("in_tv_zone", False)))
+            dones.append(bool(term or trunc))
             if term or trunc:
                 obs, _ = env.reset()
         env.close()
@@ -1266,7 +1274,7 @@ def capture_video(path, args, agent, device, seed, map_path=None, map_lines=None
                 obs_writer.write(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR))
             obs_writer.release()
         if map_path is not None and map_lines:
-            save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, vest_positions=vest_positions, fps=30)
+            save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, vest_positions=vest_positions, dones=dones, fps=30)
         return path
     except Exception as exc:  # pragma: no cover
         print(f"[viz] video skipped: {exc}")

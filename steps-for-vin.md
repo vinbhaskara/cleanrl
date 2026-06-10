@@ -174,6 +174,18 @@ Key plots to inspect:
 - sparse noise-α sweep: the α-specific noisy-TV curves,
 - very-sparse stress: `cc`/`rnd`/`c_v2` plain + full noisy-TV.
 
+**Neural-FLOPs accounting (on by default).** The summarizer also computes each method's
+hardware-independent neural compute (post-hoc from architecture + config — no re-runs), writing:
+- `flops_breakdown.csv` — per-update GFLOPs by bucket (`rollout_policy`, `rollout_aux`, `wm_update`,
+  `aux_update`, `policy_update`), FLOPs/env-step, and cumulative training/eval FLOPs per method;
+- `<scenario>__<condition>__flops_per_update.png` — stacked-bar "compute per method" figure;
+- `<...>__{return,wm_holdout}__vs_flops.png` — performance vs cumulative training FLOPs curves.
+
+This captures *neural* compute only (env simulation has no meaningful FLOP count), so the rollout
+bucket reflects policy/aux forwards, not env-stepping wall-clock — that is the intended
+hardware-independent measure of each method's overhead. Needs `torch` + the training module
+importable; pass `--no-flops` to skip.
+
 ## Step 6 — Collect the presentation visuals
 
 From the Phase-1 noisy-TV runs (see how-to §5):
@@ -195,21 +207,50 @@ videos, plus automatic per-run `plots/`. See how-to §5b. Disk: periodic checkpo
 **Note — training-time `videos/*.mp4` do NOT show the noise patch.** The noise is
 overlaid on the agent's grayscale *observation* (which drives training), not on the
 RGB buffer used for the video. To get presentation videos with the noisy TV visible,
-regenerate them post-hoc from the saved checkpoints (no re-runs, training untouched):
+regenerate them post-hoc from the saved checkpoints (no re-runs, training untouched).
+The regenerator loads every stored checkpoint and, from ONE sampled rollout, writes a
+matched RGB+map pair:
 
 ```bash
-# one run:
+# one run, every checkpoint:
+python cleanrl/regenerate_vizdoom_video.py --run runs/<run_name>
+# all noisy-TV methods:
+for d in runs/vizdoom_sparse_noisytv__*/; do
+  python cleanrl/regenerate_vizdoom_video.py --run "$d"; done
+# a single checkpoint instead of a whole run:
 python cleanrl/regenerate_vizdoom_video.py \
-  --checkpoint runs/<run_name>/ppo_curiosity_critic_vizdoom.cleanrl_model
-# batch every noisy Phase-1 run:
-for f in runs/vizdoom_sparse_noisytv__*/ppo_curiosity_critic_vizdoom.cleanrl_model; do
-  python cleanrl/regenerate_vizdoom_video.py --checkpoint "$f"; done
+  --checkpoint runs/<run_name>/checkpoints/ckpt_update007324.cleanrl_model
 ```
 
-Each writes two mp4s: `<checkpoint>_noisyTV.mp4` (pretty RGB reconstruction) and
-`<checkpoint>_obs.mp4` (the agent's exact observation — the real grayscale pixels it
-saw, upscaled). Add `--greedy` for a cleaner deterministic clip. The script prints the
-TV-zone fraction (≈0.1 for CC, ≈1.0 for RND) as a check.
+Per checkpoint it writes two **in-sync** mp4s (same rollout → same frame count), paired by
+update number:
+- `videos/update<NNNNNN>_rgbvideo_w_noisepatch.mp4` — full-res RGB with the **training-size**
+  noise patch (`tv_panel`×`tv_panel`) nearest-neighbor scaled up onto the color frame, so
+  the static has the exact granularity the agent saw;
+- `map_vids/update<NNNNNN>_mapvideo_regen.mp4` — top-down trajectory of those same steps.
+
+The `_regen` suffix never clobbers the training-time `map_vids/update<NNNNNN>.mp4`, and
+existing outputs are skipped (pass `--overwrite` to force). Actions are **sampled by default**
+(faithful to how the policy behaved during training); add `--greedy` for a deterministic
+argmax clip, `--seed N` for a different sampled take, or `--steps N` to change length. It
+prints the TV-zone fraction (≈0.1 for CC, ≈1.0 for V1/RND) as a check. The agent's exact
+grayscale observation video is already saved during training, so it is no longer produced
+here.
+
+### Play the maze yourself (live demo)
+
+To give an audience the feel of the sparse-exploration problem, walk the *exact* maze the
+agents trained on with your keyboard (ViZDoom spectator mode, Mac-friendly):
+
+```bash
+pip install vizdoom                          # once, on the Mac
+python play_vizdoom_maze.py                  # sparse maze (--scenario very_sparse for the harder one)
+python play_vizdoom_maze.py --res 1280x720   # bigger window for a projector
+```
+
+Controls: ↑ forward, ←/→ turn (click the window to focus it). The vest is the only reward;
+the episode auto-restarts on pickup. `--agent-view` strips the HUD/weapon to show the
+spartan view the agent actually gets.
 
 ---
 

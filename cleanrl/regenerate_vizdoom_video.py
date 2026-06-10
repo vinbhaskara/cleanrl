@@ -1,31 +1,45 @@
-# Standalone, post-hoc video regenerator for VizDoom Curiosity-Critic runs.
+# Post-hoc RGB + top-down-map video regenerator for VizDoom Curiosity-Critic runs.
 #
-# It loads a saved `--save-model` checkpoint, replays the trained policy in the
-# (noisy-TV) env, and writes two mp4s:
-#   <name>_noisyTV.mp4 -- pretty full-res RGB with the noise patch re-overlaid (reconstruction)
-#   <name>_obs.mp4     -- the agent's ACTUAL observation (exact grayscale pixels it saw,
-#                         including the real noise), nearest-neighbor upscaled
-# so the "noisy TV" is visible in the video.
+# For each stored checkpoint, it replays the trained policy ONCE in the (noisy-TV) env and
+# writes two videos from the SAME sampled transitions, so they stay perfectly in sync:
+#   1) a full-res RGB video with the noise patch re-overlaid -- using the SAME
+#      original-resolution patch as training (tv_panel x tv_panel), nearest-neighbor
+#      scaled up onto the color frame so the static has the exact granularity the agent saw;
+#   2) a top-down trajectory ("map") video of those same steps.
 #
-# It does NOT modify or affect the training code/results: training-time videos
-# stay clean and consistent across all runs; presentation videos are generated
-# here, uniformly, from the checkpoints you already have.
+# Outputs (paired by update number; the map uses a _regen suffix so it never clobbers the
+# training-time map_vids/update<NNNNNN>.mp4):
+#   runs/<run>/videos/update<NNNNNN>_rgbvideo_w_noisepatch.mp4
+#   runs/<run>/map_vids/update<NNNNNN>_mapvideo_regen.mp4
+#
+# The agent's exact grayscale observation video is already saved at training time, so
+# this script no longer produces an _obs.mp4.
 #
 # Usage (from repo root):
-#   python cleanrl/regenerate_vizdoom_video.py \
-#       --checkpoint runs/vizdoom_sparse_noisytv__cc__1__.../ppo_curiosity_critic_vizdoom.cleanrl_model
-#
-# Batch over every Phase-1 run:
-#   for f in runs/vizdoom_sparse_noisytv__*/ppo_curiosity_critic_vizdoom.cleanrl_model; do
-#       python cleanrl/regenerate_vizdoom_video.py --checkpoint "$f"; done
+#   # every checkpoint in a run:
+#   python cleanrl/regenerate_vizdoom_video.py --run runs/vizdoom_sparse_noisytv__cc__1__...
+#   # a single checkpoint:
+#   python cleanrl/regenerate_vizdoom_video.py --checkpoint runs/<run>/checkpoints/ckpt_update007000.cleanrl_model
+#   # batch over many runs:
+#   for d in runs/vizdoom_sparse_noisytv__*/; do python cleanrl/regenerate_vizdoom_video.py --run "$d"; done
 import argparse
+import glob
 import os
+import re
 
 import cv2
 import numpy as np
 import torch
 
-from ppo_curiosity_critic_vizdoom import Agent, Args, make_env
+from ppo_curiosity_critic_vizdoom import (
+    Agent,
+    Args,
+    SCENARIO_WADS,
+    load_wad_map_lines,
+    load_wad_vest_positions,
+    make_env,
+    save_map_video,
+)
 
 OBS_SIZE = 84  # the grayscale observation side length used in training
 
@@ -48,91 +62,129 @@ def _write_video(path, bgr_frames, fps):
     writer.release()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True, help="path to a *.cleanrl_model file")
-    ap.add_argument("--out", default=None, help="output mp4 path (default: alongside checkpoint)")
-    ap.add_argument("--steps", type=int, default=525, help="number of agent steps to roll out")
-    ap.add_argument("--seed", type=int, default=12345, help="rollout seed")
-    ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--greedy", action="store_true", help="take argmax actions instead of sampling")
-    ap.add_argument("--obs-scale", type=int, default=4, help="upscale factor for the agent-observation video")
-    cli = ap.parse_args()
+def _update_label(ckpt_path, ckpt=None):
+    """Pull the training update index from the checkpoint filename, falling back to its 'update' field."""
+    m = re.search(r"update0*(\d+)", os.path.basename(ckpt_path))
+    if m:
+        return int(m.group(1))
+    if ckpt is not None and isinstance(ckpt.get("update"), int):
+        return ckpt["update"]
+    return None
 
-    ckpt = load_checkpoint(cli.checkpoint)
+
+def _run_dir_for(ckpt_path):
+    """The run directory for a checkpoint (parent of checkpoints/ if it lives there)."""
+    d = os.path.dirname(os.path.abspath(ckpt_path))
+    return os.path.dirname(d) if os.path.basename(d) == "checkpoints" else d
+
+
+def render_rgb_and_map(ckpt_path, rgb_path, map_path, steps, seed, fps, greedy):
+    """Roll out the checkpoint's policy ONCE and write two in-sync videos from the same transitions:
+    (1) the RGB video with the training-size noise patch upscaled, and (2) the top-down map video."""
+    ckpt = load_checkpoint(ckpt_path)
     saved = ckpt.get("args", {})
-    fields = set(Args.__dataclass_fields__.keys())
-    args = Args(**{k: v for k, v in saved.items() if k in fields})
-    print(f"loaded checkpoint: method={saved.get('method')} scenario={args.scenario} "
-          f"noisy_tv={args.noisy_tv} tv_radius={args.tv_radius} tv_panel={args.tv_panel} "
-          f"global_step={ckpt.get('global_step')}")
+    args = Args(**{k: v for k, v in saved.items() if k in set(Args.__dataclass_fields__.keys())})
+    method = saved.get("method", args.method)
+    p = int(args.tv_panel)  # original training patch size (in the 84x84 obs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = make_env(args, idx=0, seed=cli.seed, expose_rgb=True)()
+    env = make_env(args, idx=0, seed=seed, expose_rgb=True)()
     n_actions = int(env.action_space.n)
     agent = Agent(n_actions).to(device)
     agent.load_state_dict(ckpt["policy_model"])
     agent.eval()
 
-    method = saved.get("method", args.method)
-    rng = np.random.default_rng(cli.seed)
-    obs, info = env.reset(seed=cli.seed)
-    rgb_frames, obs_frames, tv_steps = [], [], 0
+    rng = np.random.default_rng(seed)
+    obs, info = env.reset(seed=seed)
+    rgb_frames, xs, ys, in_tv, dones, tv_steps = [], [], [], [], [], 0
     with torch.no_grad():
-        for _ in range(cli.steps):
+        for _ in range(steps):
             obs_arr = np.asarray(obs)
-            # Newest grayscale frame = exactly the view the agent acts on, including the real
-            # noise the NoisyTVWrapper drew into the observation.
-            obs_frames.append(obs_arr[-1].copy())
             if method == "random":
                 action_i = int(rng.integers(0, n_actions))
             else:
                 obs_t = torch.tensor(obs_arr, dtype=torch.float32, device=device).unsqueeze(0)
-                if cli.greedy:
+                if greedy:
                     hidden = agent.network(obs_t / 255.0)
-                    action = torch.argmax(agent.actor(hidden), dim=1)
+                    action_i = int(torch.argmax(agent.actor(hidden), dim=1).item())
                 else:
                     action, _, _, _, _ = agent.get_action_and_value(obs_t)
-                action_i = int(action.item())
+                    action_i = int(action.item())
             obs, _, term, trunc, info = env.step(action_i)
 
             frame = np.array(info["rgb"], dtype=np.uint8)  # copy; don't mutate env buffer
             if info.get("in_tv_zone"):
                 tv_steps += 1
-                rh = max(1, int(frame.shape[0] * args.tv_panel / OBS_SIZE))
-                rw = max(1, int(frame.shape[1] * args.tv_panel / OBS_SIZE))
-                noise = rng.integers(0, 256, size=(rh, rw, 1), dtype=np.uint8)
+                rh = max(1, int(frame.shape[0] * p / OBS_SIZE))
+                rw = max(1, int(frame.shape[1] * p / OBS_SIZE))
+                # original training-size patch (p x p), then nearest-neighbor scaled up to the RGB panel
+                small = rng.integers(0, 256, size=(p, p), dtype=np.uint8)
+                big = cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)[..., None]
                 if args.noise_alpha >= 1.0:
-                    frame[:rh, :rw] = noise
+                    frame[:rh, :rw] = big
                 else:  # match the observation's blend so sweep videos show the right intensity
-                    blended = (1.0 - args.noise_alpha) * frame[:rh, :rw].astype(np.float32) + args.noise_alpha * noise
+                    blended = (1.0 - args.noise_alpha) * frame[:rh, :rw].astype(np.float32) + args.noise_alpha * big
                     frame[:rh, :rw] = np.rint(blended).astype(np.uint8)
             rgb_frames.append(frame)
+            xs.append(float(info.get("position_x", np.nan)))
+            ys.append(float(info.get("position_y", np.nan)))
+            in_tv.append(bool(info.get("in_tv_zone", False)))
+            dones.append(bool(term or trunc))
             if term or trunc:
                 obs, info = env.reset()
     env.close()
 
-    base = os.path.splitext(cli.out)[0] if cli.out else os.path.splitext(cli.checkpoint)[0]
+    # (1) RGB with the upscaled training-size noise patch
+    _write_video(rgb_path, [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in rgb_frames], fps)
+    # (2) Top-down map from the SAME sampled transitions (kept in sync with the RGB above)
+    map_ok = False
+    try:
+        wad_path = os.path.join(args.wad_dir, SCENARIO_WADS[args.scenario])
+        map_lines = load_wad_map_lines(wad_path, args.doom_map)
+        vest = load_wad_vest_positions(wad_path, args.doom_map)
+        save_map_video(map_path, map_lines, xs, ys, in_tv=in_tv, vest_positions=vest, dones=dones, fps=fps)
+        map_ok = os.path.exists(map_path)
+    except Exception as exc:  # never let a map failure lose the RGB video
+        print(f"[map] skipped: {exc}")
+    return len(rgb_frames), tv_steps, map_ok
 
-    # (1) Pretty RGB reconstruction (noise re-overlaid onto the full-res color frame).
-    rgb_path = cli.out or (base + "_noisyTV.mp4")
-    _write_video(rgb_path, [cv2.cvtColor(f, cv2.COLOR_RGB2BGR) for f in rgb_frames], cli.fps)
 
-    # (2) The agent's ACTUAL observation (exact pixels it saw: grayscale, nearest-neighbor
-    # upscaled so the static stays crisp and true to the downsampled view).
-    obs_path = base + "_obs.mp4"
-    s = max(1, cli.obs_scale)
-    obs_bgr = [
-        cv2.cvtColor(
-            cv2.resize(f, (OBS_SIZE * s, OBS_SIZE * s), interpolation=cv2.INTER_NEAREST),
-            cv2.COLOR_GRAY2BGR,
-        )
-        for f in obs_frames
-    ]
-    _write_video(obs_path, obs_bgr, cli.fps)
+def main():
+    ap = argparse.ArgumentParser(description="Regenerate RGB videos with the training-size noise patch overlaid.")
+    ap.add_argument("--run", help="run directory: process every checkpoints/ckpt_update*.cleanrl_model in it")
+    ap.add_argument("--checkpoint", help="a single *.cleanrl_model to process instead of a whole run")
+    ap.add_argument("--steps", type=int, default=525, help="number of agent steps to roll out per video")
+    ap.add_argument("--seed", type=int, default=12345, help="rollout seed")
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--greedy", action="store_true", help="take argmax actions instead of sampling")
+    ap.add_argument("--overwrite", action="store_true", help="re-render even if the output already exists")
+    cli = ap.parse_args()
 
-    print(f"wrote {rgb_path} and {obs_path}  ({len(rgb_frames)} frames, "
-          f"{tv_steps} in TV zone = {tv_steps / max(len(rgb_frames), 1):.1%})")
+    if cli.run:
+        ckpts = sorted(glob.glob(os.path.join(cli.run, "checkpoints", "ckpt_update*.cleanrl_model")))
+        if not ckpts:
+            raise SystemExit(f"no checkpoints found under {cli.run}/checkpoints/")
+    elif cli.checkpoint:
+        ckpts = [cli.checkpoint]
+    else:
+        raise SystemExit("pass --run <run_dir> (all checkpoints) or --checkpoint <file> (one).")
+
+    for ckpt_path in ckpts:
+        run_dir = _run_dir_for(ckpt_path)
+        vids_dir = os.path.join(run_dir, "videos")
+        mapvids_dir = os.path.join(run_dir, "map_vids")
+        os.makedirs(vids_dir, exist_ok=True)
+        os.makedirs(mapvids_dir, exist_ok=True)
+        upd = _update_label(ckpt_path)
+        label = f"update{upd:06d}" if upd is not None else "final"
+        rgb_path = os.path.join(vids_dir, f"{label}_rgbvideo_w_noisepatch.mp4")
+        map_path = os.path.join(mapvids_dir, f"{label}_mapvideo_regen.mp4")
+        if os.path.exists(rgb_path) and os.path.exists(map_path) and not cli.overwrite:
+            print(f"skip (exists): {rgb_path} + {map_path}")
+            continue
+        n, tv, map_ok = render_rgb_and_map(ckpt_path, rgb_path, map_path, cli.steps, cli.seed, cli.fps, cli.greedy)
+        print(f"wrote {rgb_path}" + (f" + {map_path}" if map_ok else "  (map skipped)")
+              + f"  ({n} frames, {tv} in TV zone = {tv / max(n, 1):.1%})")
 
 
 if __name__ == "__main__":
